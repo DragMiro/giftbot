@@ -1,0 +1,2 @@
+# Только для модуля GiftSender (Hikka / Heroku / любой Telethon userbot)
+telethon>=1.38.0
