@@ -1,4 +1,4 @@
-# @version=1.0.0
+# @version=1.0.1
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
 # requires: cursor-sdk>=0.1.0
@@ -49,7 +49,12 @@ if loader:
             "_cmd_doc_cursor": "Запрос к Cursor — .cursor <вопрос>",
             "_cmd_doc_cursorchat": "Начать диалог — .cursorchat",
             "_cmd_doc_cursorstop": "Завершить диалог — .cursorstop",
-            "no_key": "Укажи Cursor API key в .cfg CursorAgent → cursor_api_key",
+            "no_key": (
+                "Нужен Cursor API key.\n\n"
+                "1. <a href=\"https://cursor.com/dashboard/integrations\">cursor.com/dashboard/integrations</a>\n"
+                "2. API Keys → Create → скопируй <code>crsr_...</code>\n"
+                "3. <code>.cfg CursorAgent</code> → <code>cursor_api_key</code>"
+            ),
             "thinking": "⏳ Cursor думает...",
             "chat_on": "💬 Диалог с Cursor начат. Пиши сообщения, .cursorstop — выход.",
             "chat_off": "Диалог завершён.",
@@ -188,7 +193,10 @@ if loader:
                     "<b>Cursor</b>\n"
                     ".cursor &lt;вопрос&gt; — один запрос\n"
                     ".cursorchat — диалог\n"
-                    ".cursorstop — выход из диалога",
+                    ".cursorstop — выход\n\n"
+                    "Ключ: <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a> "
+                    "→ API Keys → <code>crsr_...</code>\n"
+                    "Вставить: <code>.cfg CursorAgent</code> → <code>cursor_api_key</code>",
                 )
                 return
             await self._ask(message, prompt)

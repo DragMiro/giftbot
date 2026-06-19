@@ -82,3 +82,31 @@ Heroku использует тот же формат модулей, что Hikk
 | `.giftcancel` | Отмена |
 | `.giftdone` | Закончить ввод текста |
 | `/done` | То же в шаге текста |
+
+---
+
+## CursorAgent
+
+```text
+.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/CursorAgent.py
+```
+
+### API key
+
+1. [cursor.com/dashboard/integrations](https://cursor.com/dashboard/integrations)
+2. **API Keys** → создать ключ (`crsr_...`)
+3. В Telegram:
+
+```text
+.cfg CursorAgent
+```
+
+→ поле **`cursor_api_key`**
+
+### Команды
+
+| Команда | Описание |
+|---------|----------|
+| `.cursor <вопрос>` | Один запрос |
+| `.cursorchat` | Диалог |
+| `.cursorstop` | Выход из диалога |

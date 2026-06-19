@@ -67,7 +67,14 @@ pip install -r requirements-hikka.txt
 .cfg CursorAgent
 ```
 
-- `cursor_api_key` — ключ из [Cursor Dashboard → Integrations](https://cursor.com/dashboard/integrations)
+Поле **`cursor_api_key`**:
+
+1. Открой [cursor.com/dashboard/integrations](https://cursor.com/dashboard/integrations)
+2. **API Keys** → **Create** (или Add)
+3. Скопируй ключ формата `crsr_...` (показывается один раз)
+4. Вставь в `.cfg CursorAgent` → `cursor_api_key`
+
+> Не публикуй ключ в чатах и GitHub. Если утёк — удали и создай новый в Integrations.
 - `repo_url` / `repo_branch` — репозиторий для cloud-агента (по умолчанию giftbot)
 
 Команды:
