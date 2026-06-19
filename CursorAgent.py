@@ -1,4 +1,4 @@
-# @version=1.0.1
+# @version=1.0.2
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
 # requires: cursor-sdk>=0.1.0
@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 
 from telethon.tl.custom import Message
 
@@ -23,9 +22,6 @@ try:
     from .. import loader, utils
 except ImportError:
     loader = None  # type: ignore[assignment]
-
-if TYPE_CHECKING:
-    from cursor_sdk import AsyncAgent, AsyncClient
 
 
 def _chunks(text: str, size: int = 3900) -> list[str]:
@@ -59,41 +55,56 @@ if loader:
             "chat_on": "💬 Диалог с Cursor начат. Пиши сообщения, .cursorstop — выход.",
             "chat_off": "Диалог завершён.",
             "no_chat": "Сначала .cursorchat",
+            "no_sdk": (
+                "Нет пакета <code>cursor-sdk</code>.\n"
+                "В <code>.terminal</code>:\n"
+                "<code>pip install cursor-sdk</code>\n"
+                "Потом <code>.restart -f</code>"
+            ),
             "error": "❌ Cursor: {}",
         }
 
         strings_ru = strings.copy()
 
         def __init__(self) -> None:
-            self._client: AsyncClient | None = None
-            self._agents: dict[int, AsyncAgent] = {}
+            self._client = None
+            self._agents: dict = {}
             self._chat_users: set[int] = set()
             self.config = loader.ModuleConfig(
                 loader.ConfigValue(
                     "cursor_api_key",
                     "",
+                    lambda: "Cursor API key (Dashboard → Integrations, crsr_...)",
                     validator=loader.validators.Hidden(),
-                    doc="Cursor API key (Dashboard → Integrations)",
                 ),
                 loader.ConfigValue(
                     "model",
                     "composer-2.5",
-                    lambda v: str(v).strip() or "composer-2.5",
-                    doc="Модель Cursor",
+                    lambda: "Модель Cursor",
+                    validator=loader.validators.String(),
                 ),
                 loader.ConfigValue(
                     "repo_url",
                     "https://github.com/DragMiro/giftbot",
-                    lambda v: str(v).strip(),
-                    doc="GitHub-репозиторий для cloud-агента",
+                    lambda: "GitHub-репозиторий для cloud-агента",
+                    validator=loader.validators.Link(),
                 ),
                 loader.ConfigValue(
                     "repo_branch",
                     "main",
-                    lambda v: str(v).strip() or "main",
-                    doc="Ветка репозитория",
+                    lambda: "Ветка репозитория",
+                    validator=loader.validators.String(),
                 ),
             )
+
+        @staticmethod
+        def _import_cursor_sdk():
+            try:
+                import cursor_sdk
+
+                return cursor_sdk
+            except ImportError as exc:
+                raise ImportError("cursor-sdk") from exc
 
         def _api_key(self) -> str:
             key = (self.config["cursor_api_key"] or "").strip()
@@ -104,30 +115,28 @@ if loader:
             return (os.environ.get("CURSOR_API_KEY") or "").strip()
 
         def _cloud_options(self):
-            from cursor_sdk import AgentOptions, CloudAgentOptions, CloudRepository
-
-            return AgentOptions(
+            cs = self._import_cursor_sdk()
+            return cs.AgentOptions(
                 api_key=self._api_key(),
-                model=self.config["model"],
-                cloud=CloudAgentOptions(
+                model=(self.config["model"] or "composer-2.5").strip(),
+                cloud=cs.CloudAgentOptions(
                     repos=[
-                        CloudRepository(
-                            url=self.config["repo_url"],
-                            starting_ref=self.config["repo_branch"],
+                        cs.CloudRepository(
+                            url=(self.config["repo_url"] or "").strip(),
+                            starting_ref=(self.config["repo_branch"] or "main").strip(),
                         )
                     ],
                     skip_reviewer_request=True,
                 ),
             )
 
-        async def _ensure_client(self) -> AsyncClient:
-            from cursor_sdk import AsyncClient
-
+        async def _ensure_client(self):
+            cs = self._import_cursor_sdk()
             if self._client is None:
-                self._client = await AsyncClient.launch_bridge()
+                self._client = await cs.AsyncClient.launch_bridge()
             return self._client
 
-        async def _get_agent(self, uid: int) -> AsyncAgent:
+        async def _get_agent(self, uid: int):
             if uid in self._agents:
                 return self._agents[uid]
 
@@ -147,6 +156,12 @@ if loader:
                 await utils.answer(message, chunk)
 
         async def _ask(self, message: Message, prompt: str, *, chat: bool = False) -> None:
+            try:
+                cs = self._import_cursor_sdk()
+            except ImportError:
+                await utils.answer(message, self.strings("no_sdk"))
+                return
+
             if not self._api_key():
                 await utils.answer(message, self.strings("no_key"))
                 return
@@ -154,8 +169,6 @@ if loader:
             await utils.answer(message, self.strings("thinking"))
 
             try:
-                from cursor_sdk import AsyncAgent, CursorAgentError
-
                 client = await self._ensure_client()
 
                 if chat:
@@ -163,7 +176,7 @@ if loader:
                     run = await agent.send(prompt)
                     result = await run.wait()
                 else:
-                    result = await AsyncAgent.prompt(
+                    result = await cs.AsyncAgent.prompt(
                         prompt,
                         self._cloud_options(),
                         client=client,
