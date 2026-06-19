@@ -1,4 +1,4 @@
-# @version=1.0.3
+# @version=1.0.4
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -70,8 +70,8 @@ if loader:
         strings_ru = strings.copy()
 
         def __init__(self) -> None:
-            self._client = None
-            self._agents: dict = {}
+            self._cursor_bridge = None
+            self._cursor_agents: dict = {}
             self._chat_users: set[int] = set()
             self.config = loader.ModuleConfig(
                 loader.ConfigValue(
@@ -129,23 +129,23 @@ if loader:
                 ),
             )
 
-        async def _ensure_client(self):
+        async def _ensure_bridge(self):
             cs = self._import_cursor_sdk()
-            if self._client is None:
-                self._client = await cs.AsyncClient.launch_bridge()
-            return self._client
+            if self._cursor_bridge is None:
+                self._cursor_bridge = await cs.AsyncClient.launch_bridge()
+            return self._cursor_bridge
 
         async def _get_agent(self, uid: int):
-            if uid in self._agents:
-                return self._agents[uid]
+            if uid in self._cursor_agents:
+                return self._cursor_agents[uid]
 
-            client = await self._ensure_client()
-            agent = await client.create_agent(self._cloud_options())
-            self._agents[uid] = agent
+            bridge = await self._ensure_bridge()
+            agent = await bridge.create_agent(self._cloud_options())
+            self._cursor_agents[uid] = agent
             return agent
 
         async def _close_agent(self, uid: int) -> None:
-            agent = self._agents.pop(uid, None)
+            agent = self._cursor_agents.pop(uid, None)
             self._chat_users.discard(uid)
             if agent is not None:
                 await agent.close()
@@ -168,7 +168,7 @@ if loader:
             await utils.answer(message, self.strings("thinking"))
 
             try:
-                client = await self._ensure_client()
+                bridge = await self._ensure_bridge()
 
                 if chat:
                     agent = await self._get_agent(message.sender_id)
@@ -178,7 +178,7 @@ if loader:
                     result = await cs.AsyncAgent.prompt(
                         prompt,
                         self._cloud_options(),
-                        client=client,
+                        client=bridge,
                     )
 
                 if result.status == "error":
