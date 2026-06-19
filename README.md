@@ -41,7 +41,7 @@ pip install -r requirements-hikka.txt
 .dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/GiftSender.py
 ```
 
-> При `.dlm` библиотека `giftsender_core.py` подтягивается автоматически с GitHub.
+> `GiftSender.py` — один самодостаточный файл, без загрузок из интернета.
 
 ### 3. Используй
 

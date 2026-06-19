@@ -58,7 +58,8 @@ Heroku использует тот же формат модулей, что Hikk
 .dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/GiftSender.py
 ```
 
-> URL должен быть `raw.githubusercontent.com`, не `github.com/...` — иначе Heroku не сможет разобрать ссылку.
+> URL должен быть `raw.githubusercontent.com`, не `github.com/...` — иначе Heroku не сможет разобрать ссылку.  
+> Модуль — один файл, ничего не качает из сети при загрузке.
 
 ---
 
