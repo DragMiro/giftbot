@@ -1,4 +1,4 @@
-# @version=1.0.4
+# @version=1.0.5
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -16,6 +16,9 @@ import logging
 from telethon.tl.custom import Message
 
 logger = logging.getLogger(__name__)
+
+# Heroku перезаписывает self._client Telegram-клиентом — храним мост SDK вне instance.
+_cursor_sdk_bridge = None
 
 try:
     from .. import loader, utils
@@ -70,7 +73,6 @@ if loader:
         strings_ru = strings.copy()
 
         def __init__(self) -> None:
-            self._cursor_bridge = None
             self._cursor_agents: dict = {}
             self._chat_users: set[int] = set()
             self.config = loader.ModuleConfig(
@@ -130,10 +132,13 @@ if loader:
             )
 
         async def _ensure_bridge(self):
+            global _cursor_sdk_bridge
             cs = self._import_cursor_sdk()
-            if self._cursor_bridge is None:
-                self._cursor_bridge = await cs.AsyncClient.launch_bridge()
-            return self._cursor_bridge
+            bridge = _cursor_sdk_bridge
+            if bridge is None or not hasattr(bridge, "create_agent"):
+                bridge = await cs.AsyncClient.launch_bridge()
+                _cursor_sdk_bridge = bridge
+            return bridge
 
         async def _get_agent(self, uid: int):
             if uid in self._cursor_agents:
@@ -193,7 +198,8 @@ if loader:
                     await utils.answer(message, self.strings("error").format(exc))
                 else:
                     logger.exception("cursor ask failed")
-                    await utils.answer(message, self.strings("error").format(exc))
+                    hint = f"{exc} [CursorAgent v1.0.5]"
+                    await utils.answer(message, self.strings("error").format(hint))
 
         @loader.command(ru_doc="Запрос к Cursor — .cursor <вопрос>")
         async def cursorcmd(self, message: Message) -> None:
