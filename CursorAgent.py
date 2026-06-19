@@ -1,7 +1,6 @@
-# @version=1.0.2
+# @version=1.0.3
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
-# requires: cursor-sdk>=0.1.0
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
 
 Команды:
@@ -61,6 +60,10 @@ if loader:
                 "<code>pip install cursor-sdk</code>\n"
                 "Потом <code>.restart -f</code>"
             ),
+            "load_hint": (
+                "Если модуль не грузится — очисти кэш:\n"
+                "<code>rm -f ~/.heroku/modules_cache/*.py</code>"
+            ),
             "error": "❌ Cursor: {}",
         }
 
@@ -74,26 +77,22 @@ if loader:
                 loader.ConfigValue(
                     "cursor_api_key",
                     "",
-                    lambda: "Cursor API key (Dashboard → Integrations, crsr_...)",
-                    validator=loader.validators.Hidden(),
+                    lambda: "Cursor API key (crsr_... из Integrations)",
                 ),
                 loader.ConfigValue(
                     "model",
                     "composer-2.5",
                     lambda: "Модель Cursor",
-                    validator=loader.validators.String(),
                 ),
                 loader.ConfigValue(
                     "repo_url",
                     "https://github.com/DragMiro/giftbot",
                     lambda: "GitHub-репозиторий для cloud-агента",
-                    validator=loader.validators.Link(),
                 ),
                 loader.ConfigValue(
                     "repo_branch",
                     "main",
                     lambda: "Ветка репозитория",
-                    validator=loader.validators.String(),
                 ),
             )
 
