@@ -1,17 +1,22 @@
-# @version=1.0.5
+# @version=1.1.0
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
 
 Команды:
-  .cursor <вопрос>  — один запрос к агенту
+  .cursor <вопрос>  — запрос с контекстом чата
   .cursorchat       — диалог с агентом
   .cursorstop       — завершить диалог
+  .cursorwatch      — следить за чатом и предлагать помощь
+  .cursorunwatch    — перестать следить
 """
 
 from __future__ import annotations
 
+import html
 import logging
+import re
+import time
 
 from telethon.tl.custom import Message
 
@@ -25,6 +30,33 @@ try:
 except ImportError:
     loader = None  # type: ignore[assignment]
 
+_CONTEXT_HEADER = """Ты — умный помощник в Telegram userbot.
+Отвечай по-русски, кратко и по делу. Учитывай контекст чата: кто пишет, где, о чём разговор.
+
+{context}
+
+---
+Запрос пользователя:
+"""
+
+_PROACTIVE_HEADER = """Ты наблюдаешь за Telegram-чатом от имени владельца userbot.
+Изучи контекст. Если уместно мягко предложить помощь — напиши 1–3 коротких предложения.
+Если вмешиваться не стоит — ответь ровно: SKIP
+
+Не используй markdown. Можно 1 emoji в начале.
+
+{context}
+
+---
+Триггерное сообщение:
+"""
+
+_HELP_TRIGGERS = re.compile(
+    r"(?:\?|помоги|помощь|не работает|ошибк|баг|как сделать|как настроить|"
+    r"не получается|не могу|подскаж|help|how to|issue|problem|stuck)",
+    re.IGNORECASE,
+)
+
 
 def _chunks(text: str, size: int = 3900) -> list[str]:
     if len(text) <= size:
@@ -34,6 +66,61 @@ def _chunks(text: str, size: int = 3900) -> list[str]:
         parts.append(text[:size])
         text = text[size:]
     return parts
+
+
+def _escape(text: str) -> str:
+    return html.escape(text or "", quote=False)
+
+
+def _format_inline(text: str) -> str:
+    text = _escape(text)
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", text)
+    return text
+
+
+def _format_cursor_reply(text: str, *, model: str, proactive: bool = False) -> str:
+    raw = (text or "").strip() or "(пустой ответ)"
+    parts: list[str] = []
+
+    if proactive:
+        parts.append("💡 <b>Подсказка</b>")
+    else:
+        parts.append("🤖 <b>Cursor</b>")
+
+    blocks = re.split(r"```(?:\w+)?\n?", raw)
+    for idx, block in enumerate(blocks):
+        block = block.strip()
+        if not block:
+            continue
+        if idx % 2 == 1:
+            parts.append(f"<pre>{_escape(block)}</pre>")
+        else:
+            for para in re.split(r"\n{2,}", block):
+                para = para.strip()
+                if not para:
+                    continue
+                lines = [_format_inline(line) for line in para.split("\n")]
+                parts.append("\n".join(lines))
+
+    parts.append(f"\n<i>— {_escape(model)}</i>")
+    return "\n\n".join(parts)
+
+
+def _person_name(entity) -> str:
+    if entity is None:
+        return "неизвестно"
+    first = getattr(entity, "first_name", None) or ""
+    last = getattr(entity, "last_name", None) or ""
+    name = f"{first} {last}".strip()
+    username = getattr(entity, "username", None)
+    if username:
+        return f"{name or username} (@{username})"
+    title = getattr(entity, "title", None)
+    if title:
+        return title
+    return name or f"id:{getattr(entity, 'id', '?')}"
 
 
 if loader:
@@ -47,16 +134,29 @@ if loader:
             "_cmd_doc_cursor": "Запрос к Cursor — .cursor <вопрос>",
             "_cmd_doc_cursorchat": "Начать диалог — .cursorchat",
             "_cmd_doc_cursorstop": "Завершить диалог — .cursorstop",
+            "_cmd_doc_cursorwatch": "Следить за чатом — .cursorwatch",
+            "_cmd_doc_cursorunwatch": "Не следить — .cursorunwatch",
             "no_key": (
-                "Нужен Cursor API key.\n\n"
-                "1. <a href=\"https://cursor.com/dashboard/integrations\">cursor.com/dashboard/integrations</a>\n"
-                "2. API Keys → Create → скопируй <code>crsr_...</code>\n"
+                "🔑 <b>Нужен Cursor API key</b>\n\n"
+                "1. <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a>\n"
+                "2. API Keys → Create → <code>crsr_...</code>\n"
                 "3. <code>.cfg CursorAgent</code> → <code>cursor_api_key</code>"
             ),
-            "thinking": "⏳ Cursor думает...",
-            "chat_on": "💬 Диалог с Cursor начат. Пиши сообщения, .cursorstop — выход.",
-            "chat_off": "Диалог завершён.",
-            "no_chat": "Сначала .cursorchat",
+            "thinking": "⏳ <i>Cursor анализирует чат...</i>",
+            "chat_on": (
+                "💬 <b>Диалог с Cursor</b>\n\n"
+                "Пиши сообщения — я учитываю контекст чата.\n"
+                "<code>.cursorstop</code> — выход"
+            ),
+            "chat_off": "✅ Диалог завершён.",
+            "no_chat": "Сначала <code>.cursorchat</code>",
+            "watch_on": (
+                "👁 <b>Наблюдение включено</b>\n\n"
+                "Буду следить за чатом и предлагать помощь, когда уместно.\n"
+                "<code>.cursorunwatch</code> — выключить"
+            ),
+            "watch_off": "👁 Наблюдение за этим чатом выключено.",
+            "watch_list_empty": "Нет чатов под наблюдением. Включи: <code>.cursorwatch</code>",
             "no_sdk": (
                 "Нет пакета <code>cursor-sdk</code>.\n"
                 "В <code>.terminal</code>:\n"
@@ -64,10 +164,12 @@ if loader:
                 "Потом <code>.restart -f</code>"
             ),
             "load_hint": (
-                "Если модуль не грузится — очисти кэш:\n"
-                "<code>rm -f ~/.heroku/modules_cache/*.py</code>"
+                "Старая версия? Сначала:\n"
+                "<code>.ulm CursorAgent</code>\n"
+                "<code>rm -f ~/.heroku/modules_cache/*.py</code>\n"
+                "<code>.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/CursorAgent.py</code>"
             ),
-            "error": "❌ Cursor: {}",
+            "error": "❌ <b>Cursor</b>\n\n{}",
         }
 
         strings_ru = strings.copy()
@@ -75,6 +177,8 @@ if loader:
         def __init__(self) -> None:
             self._cursor_agents: dict = {}
             self._chat_users: set[int] = set()
+            self._watched_chats: set[int] = set()
+            self._proactive_at: dict[int, float] = {}
             self.config = loader.ModuleConfig(
                 loader.ConfigValue(
                     "cursor_api_key",
@@ -96,7 +200,32 @@ if loader:
                     "main",
                     lambda: "Ветка репозитория",
                 ),
+                loader.ConfigValue(
+                    "context_messages",
+                    20,
+                    lambda v: max(5, min(50, int(v))),
+                    "Сколько последних сообщений читать для контекста",
+                ),
+                loader.ConfigValue(
+                    "proactive_enabled",
+                    True,
+                    lambda: "Предлагать помощь в чатах под наблюдением",
+                ),
+                loader.ConfigValue(
+                    "proactive_cooldown",
+                    300,
+                    lambda v: max(60, int(v)),
+                    "Пауза между подсказками в одном чате (сек)",
+                ),
             )
+
+        async def client_ready(self, client, db) -> None:  # noqa: ARG002
+            saved = self._db.get(self.strings("name"), "watched_chats", [])
+            if isinstance(saved, list):
+                self._watched_chats = {int(x) for x in saved}
+
+        def _save_watched(self) -> None:
+            self._db.set(self.strings("name"), "watched_chats", list(self._watched_chats))
 
         @staticmethod
         def _import_cursor_sdk():
@@ -115,11 +244,14 @@ if loader:
 
             return (os.environ.get("CURSOR_API_KEY") or "").strip()
 
+        def _model(self) -> str:
+            return (self.config["model"] or "composer-2.5").strip()
+
         def _cloud_options(self):
             cs = self._import_cursor_sdk()
             return cs.AgentOptions(
                 api_key=self._api_key(),
-                model=(self.config["model"] or "composer-2.5").strip(),
+                model=self._model(),
                 cloud=cs.CloudAgentOptions(
                     repos=[
                         cs.CloudRepository(
@@ -155,51 +287,160 @@ if loader:
             if agent is not None:
                 await agent.close()
 
-        async def _reply_text(self, message: Message, text: str) -> None:
-            for chunk in _chunks(text):
+        async def _reply_text(
+            self,
+            message: Message,
+            text: str,
+            *,
+            proactive: bool = False,
+        ) -> None:
+            body = _format_cursor_reply(text, model=self._model(), proactive=proactive)
+            for chunk in _chunks(body):
                 await utils.answer(message, chunk)
 
-        async def _ask(self, message: Message, prompt: str, *, chat: bool = False) -> None:
+        async def _describe_chat(self, message: Message) -> list[str]:
+            lines: list[str] = []
+            chat = await message.get_chat()
+            sender = await message.get_sender()
+
+            if message.is_private:
+                lines.append("📍 Тип: личная переписка")
+                lines.append(f"👤 Собеседник: {_person_name(sender)}")
+            elif getattr(message, "is_group", False):
+                lines.append("📍 Тип: группа")
+                lines.append(f"💬 Чат: {_person_name(chat)}")
+                if getattr(chat, "participants_count", None):
+                    lines.append(f"👥 Участников: {chat.participants_count}")
+            elif getattr(message, "is_channel", False):
+                lines.append("📍 Тип: канал")
+                lines.append(f"📢 Канал: {_person_name(chat)}")
+            else:
+                lines.append(f"📍 Чат id: {message.chat_id}")
+
+            me = await self.client.get_me()
+            lines.append(f"🤖 Userbot: {_person_name(me)}")
+            lines.append(f"✍️ Автор запроса: {_person_name(sender)}")
+            return lines
+
+        async def _recent_messages(self, message: Message) -> list[str]:
+            limit = int(self.config["context_messages"])
+            rows: list[str] = []
+            async for msg in self.client.iter_messages(message.chat_id, limit=limit):
+                text = (msg.raw_text or msg.message or "").strip()
+                if not text:
+                    continue
+                author = await msg.get_sender()
+                who = _person_name(author)
+                stamp = msg.date.strftime("%H:%M") if msg.date else "??:??"
+                mark = " ← текущее" if msg.id == message.id else ""
+                rows.append(f"[{stamp}] {who}: {text[:500]}{mark}")
+            rows.reverse()
+            return rows
+
+        async def _build_context(self, message: Message) -> str:
+            try:
+                meta = await self._describe_chat(message)
+                history = await self._recent_messages(message)
+            except Exception:
+                logger.exception("chat context failed")
+                return "Контекст чата недоступен."
+
+            parts = ["=== Контекст Telegram ===", *meta]
+            if history:
+                parts.append("\n=== Последние сообщения ===")
+                parts.extend(history)
+            return "\n".join(parts)
+
+        def _wrap_prompt(self, prompt: str, context: str, *, proactive: bool = False) -> str:
+            header = _PROACTIVE_HEADER if proactive else _CONTEXT_HEADER
+            return header.format(context=context) + prompt
+
+        def _should_offer_help(self, message: Message) -> bool:
+            if getattr(message, "out", False):
+                return False
+            if message.sender_id == self.tg_id:
+                return False
+            text = (message.raw_text or "").strip()
+            if len(text) < 8:
+                return False
+            if text.startswith(".") or text.startswith("/"):
+                return False
+            return bool(_HELP_TRIGGERS.search(text))
+
+        def _cooldown_ok(self, chat_id: int) -> bool:
+            cooldown = int(self.config["proactive_cooldown"])
+            last = self._proactive_at.get(chat_id, 0.0)
+            return time.time() - last >= cooldown
+
+        async def _ask(
+            self,
+            message: Message,
+            prompt: str,
+            *,
+            chat: bool = False,
+            proactive: bool = False,
+            with_context: bool = True,
+        ) -> str | None:
             try:
                 cs = self._import_cursor_sdk()
             except ImportError:
                 await utils.answer(message, self.strings("no_sdk"))
-                return
+                return None
 
             if not self._api_key():
                 await utils.answer(message, self.strings("no_key"))
-                return
+                return None
 
-            await utils.answer(message, self.strings("thinking"))
+            if not proactive:
+                await utils.answer(message, self.strings("thinking"))
 
             try:
+                context = await self._build_context(message) if with_context else ""
+                full_prompt = (
+                    self._wrap_prompt(prompt, context, proactive=proactive)
+                    if with_context
+                    else prompt
+                )
                 bridge = await self._ensure_bridge()
 
                 if chat:
                     agent = await self._get_agent(message.sender_id)
-                    run = await agent.send(prompt)
+                    run = await agent.send(full_prompt)
                     result = await run.wait()
                 else:
                     result = await cs.AsyncAgent.prompt(
-                        prompt,
+                        full_prompt,
                         self._cloud_options(),
                         client=bridge,
                     )
 
                 if result.status == "error":
-                    await utils.answer(message, self.strings("error").format("run failed"))
-                    return
+                    if not proactive:
+                        await utils.answer(message, self.strings("error").format("run failed"))
+                    return None
 
-                text = (result.result or "").strip() or "(пустой ответ)"
-                await self._reply_text(message, text)
+                text = (result.result or "").strip()
+                if proactive:
+                    if not text or text.upper() == "SKIP":
+                        return None
+                    await self._reply_text(message, text, proactive=True)
+                    self._proactive_at[message.chat_id] = time.time()
+                    return text
+
+                await self._reply_text(message, text or "(пустой ответ)")
+                return text
             except Exception as exc:
                 name = type(exc).__name__
-                if name == "CursorAgentError":
-                    await utils.answer(message, self.strings("error").format(exc))
+                if not proactive:
+                    if name == "CursorAgentError":
+                        await utils.answer(message, self.strings("error").format(_escape(str(exc))))
+                    else:
+                        logger.exception("cursor ask failed")
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.1.0]"
+                        await utils.answer(message, self.strings("error").format(hint))
                 else:
-                    logger.exception("cursor ask failed")
-                    hint = f"{exc} [CursorAgent v1.0.5]"
-                    await utils.answer(message, self.strings("error").format(hint))
+                    logger.exception("cursor proactive failed")
+                return None
 
         @loader.command(ru_doc="Запрос к Cursor — .cursor <вопрос>")
         async def cursorcmd(self, message: Message) -> None:
@@ -208,13 +449,16 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "<b>Cursor</b>\n"
-                    ".cursor &lt;вопрос&gt; — один запрос\n"
-                    ".cursorchat — диалог\n"
-                    ".cursorstop — выход\n\n"
-                    "Ключ: <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a> "
-                    "→ API Keys → <code>crsr_...</code>\n"
-                    "Вставить: <code>.cfg CursorAgent</code> → <code>cursor_api_key</code>",
+                    "🤖 <b>Cursor</b> <i>v1.1.0</i>\n\n"
+                    "▫️ <code>.cursor &lt;вопрос&gt;</code> — запрос с контекстом чата\n"
+                    "▫️ <code>.cursorchat</code> — диалог\n"
+                    "▫️ <code>.cursorstop</code> — выход из диалога\n"
+                    "▫️ <code>.cursorwatch</code> — следить за чатом\n"
+                    "▫️ <code>.cursorunwatch</code> — не следить\n"
+                    "▫️ <code>.cursorwatchlist</code> — список чатов\n\n"
+                    "🔑 Ключ: <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a> "
+                    "→ <code>crsr_...</code>\n"
+                    "⚙️ <code>.cfg CursorAgent</code>",
                 )
                 return
             await self._ask(message, prompt)
@@ -237,6 +481,42 @@ if loader:
             await self._close_agent(message.sender_id)
             await utils.answer(message, self.strings("chat_off"))
 
+        @loader.command(ru_doc="Следить за чатом — .cursorwatch")
+        async def cursorwatchcmd(self, message: Message) -> None:
+            """Следить за чатом — .cursorwatch"""
+            if message.is_private:
+                await utils.answer(
+                    message,
+                    "👁 Наблюдение для <b>групп и каналов</b>.\n"
+                    "Выполни команду прямо в нужном чате.",
+                )
+                return
+            self._watched_chats.add(message.chat_id)
+            self._save_watched()
+            await utils.answer(message, self.strings("watch_on"))
+
+        @loader.command(ru_doc="Не следить — .cursorunwatch")
+        async def cursorunwatchcmd(self, message: Message) -> None:
+            """Не следить — .cursorunwatch"""
+            self._watched_chats.discard(message.chat_id)
+            self._save_watched()
+            await utils.answer(message, self.strings("watch_off"))
+
+        @loader.command(ru_doc="Список чатов под наблюдением")
+        async def cursorwatchlistcmd(self, message: Message) -> None:
+            """Список чатов под наблюдением"""
+            if not self._watched_chats:
+                await utils.answer(message, self.strings("watch_list_empty"))
+                return
+            lines = ["👁 <b>Чаты под наблюдением</b>\n"]
+            for chat_id in sorted(self._watched_chats):
+                try:
+                    entity = await self.client.get_entity(chat_id)
+                    lines.append(f"▫️ {_escape(_person_name(entity))} <code>{chat_id}</code>")
+                except Exception:
+                    lines.append(f"▫️ <code>{chat_id}</code>")
+            await utils.answer(message, "\n".join(lines))
+
         @loader.watcher(
             incoming=True,
             func=lambda m: m.is_private and not getattr(m, "out", False),
@@ -249,6 +529,24 @@ if loader:
             if not raw or raw.startswith("."):
                 return
             await self._ask(message, raw, chat=True)
+
+        @loader.watcher(
+            incoming=True,
+            func=lambda m: not m.is_private and not getattr(m, "out", False),
+        )
+        async def cursor_proactive_watcher(self, message: Message) -> None:
+            if not self.config["proactive_enabled"]:
+                return
+            if message.chat_id not in self._watched_chats:
+                return
+            if not self._api_key():
+                return
+            if not self._should_offer_help(message):
+                return
+            if not self._cooldown_ok(message.chat_id):
+                return
+            text = (message.raw_text or "").strip()
+            await self._ask(message, text, proactive=True)
 
 else:
     CursorAgentMod = None  # type: ignore[misc, assignment]
