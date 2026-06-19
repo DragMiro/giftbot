@@ -1,10 +1,14 @@
-# @version=1.1.2
+# @version=1.2.0
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
 
 Команды:
   .cursor <вопрос>  — запрос с контекстом чата
+  .cursor img: ...  — генерация картинки
+  .cursor ssh: ...  — команда на SSH-сервере
+  .cursorimg        — картинка по описанию
+  .cursorssh        — выполнить команду по SSH
   .cursorchat       — диалог с агентом
   .cursorstop       — завершить диалог
   .cursorwatch      — следить за чатом и предлагать помощь
@@ -17,6 +21,7 @@ import html
 import logging
 import re
 import time
+import urllib.parse
 
 from telethon.tl.custom import Message
 
@@ -56,6 +61,24 @@ _HELP_TRIGGERS = re.compile(
     r"не получается|не могу|подскаж|help|how to|issue|problem|stuck)",
     re.IGNORECASE,
 )
+
+_IMG_PREFIX = re.compile(
+    r"^(?:img|image|картинка|нарисуй|рисуй|draw)\s*[:\-]\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_SSH_PREFIX = re.compile(
+    r"^(?:ssh|сервер|server)\s*[:\-]\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_route(prompt: str) -> tuple[str, str]:
+    text = (prompt or "").strip()
+    for pattern, kind in ((_IMG_PREFIX, "img"), (_SSH_PREFIX, "ssh")):
+        match = pattern.match(text)
+        if match:
+            return kind, match.group(1).strip()
+    return "ask", text
 
 
 def _chunks(text: str, size: int = 3900) -> list[str]:
@@ -169,6 +192,8 @@ if loader:
             "_cmd_doc_cursorstop": "Завершить диалог — .cursorstop",
             "_cmd_doc_cursorwatch": "Следить за чатом — .cursorwatch",
             "_cmd_doc_cursorunwatch": "Не следить — .cursorunwatch",
+            "_cmd_doc_cursorimg": "Картинка по описанию — .cursorimg",
+            "_cmd_doc_cursorssh": "Команда по SSH — .cursorssh",
             "no_key": (
                 "🔑 <b>Нужен Cursor API key</b>\n\n"
                 "1. <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a>\n"
@@ -203,6 +228,21 @@ if loader:
                 "<code>.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/CursorAgent.py</code>"
             ),
             "error": "❌ <b>Cursor</b>\n\n{}",
+            "owner_only": "🔒 Только владелец userbot может это делать.",
+            "img_generating": "🎨 <i>Генерирую картинку...</i>",
+            "img_caption": "🎨 <b>Картинка</b>\n\n💬 <b>Запрос</b>\n{query}",
+            "ssh_running": "🖥 <i>Выполняю на сервере...</i>",
+            "ssh_need_cfg": (
+                "🖥 <b>SSH не настроен</b>\n\n"
+                "<code>.cfg CursorAgent</code> →\n"
+                "<code>ssh_enabled</code> = True\n"
+                "<code>ssh_host</code>, <code>ssh_user</code>\n"
+                "<code>ssh_password</code> или <code>ssh_key_path</code>"
+            ),
+            "no_paramiko": (
+                "Нет <code>paramiko</code>.\n"
+                "<code>.terminal pip install paramiko</code>"
+            ),
         }
 
         strings_ru = strings.copy()
@@ -250,6 +290,49 @@ if loader:
                     300,
                     lambda: "Пауза между подсказками в одном чате (сек)",
                     validator=loader.validators.Integer(minimum=60),
+                ),
+                loader.ConfigValue(
+                    "image_provider",
+                    "pollinations",
+                    lambda: "Генерация картинок: pollinations или openai",
+                ),
+                loader.ConfigValue(
+                    "openai_api_key",
+                    "",
+                    lambda: "OpenAI API key для DALL-E (если provider=openai)",
+                ),
+                loader.ConfigValue(
+                    "ssh_enabled",
+                    False,
+                    lambda: "Разрешить SSH-команды (.cursorssh / ssh:)",
+                    validator=loader.validators.Boolean(),
+                ),
+                loader.ConfigValue(
+                    "ssh_host",
+                    "",
+                    lambda: "SSH хост (IP или домен)",
+                ),
+                loader.ConfigValue(
+                    "ssh_port",
+                    22,
+                    lambda: "SSH порт",
+                    validator=loader.validators.Integer(minimum=1, maximum=65535),
+                ),
+                loader.ConfigValue(
+                    "ssh_user",
+                    "",
+                    lambda: "SSH пользователь",
+                ),
+                loader.ConfigValue(
+                    "ssh_password",
+                    "",
+                    lambda: "SSH пароль (или оставь пустым и укажи ssh_key_path)",
+                    validator=loader.validators.Hidden(),
+                ),
+                loader.ConfigValue(
+                    "ssh_key_path",
+                    "",
+                    lambda: "Путь к приватному SSH-ключу на сервере userbot",
                 ),
             )
 
@@ -412,6 +495,173 @@ if loader:
             last = self._proactive_at.get(chat_id, 0.0)
             return time.time() - last >= cooldown
 
+        def _owner_only(self, message: Message) -> bool:
+            return message.sender_id == self.tg_id
+
+        @staticmethod
+        def _ssh_exec(
+            host: str,
+            port: int,
+            user: str,
+            password: str,
+            key_path: str,
+            command: str,
+            timeout: int = 45,
+        ) -> tuple[int, str, str]:
+            import paramiko
+
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            kwargs: dict = {
+                "hostname": host,
+                "port": port,
+                "username": user,
+                "timeout": timeout,
+                "allow_agent": False,
+                "look_for_keys": False,
+            }
+            if key_path:
+                kwargs["key_filename"] = key_path
+            else:
+                kwargs["password"] = password
+            client.connect(**kwargs)
+            try:
+                _, stdout, stderr = client.exec_command(command, timeout=timeout)
+                out = stdout.read().decode("utf-8", errors="replace")
+                err = stderr.read().decode("utf-8", errors="replace")
+                code = stdout.channel.recv_exit_status()
+                return code, out, err
+            finally:
+                client.close()
+
+        async def _fetch_image_bytes(self, prompt: str) -> bytes:
+            provider = (self.config["image_provider"] or "pollinations").strip().lower()
+
+            if provider == "openai":
+                import httpx
+
+                key = (self.config["openai_api_key"] or "").strip()
+                if not key:
+                    raise RuntimeError("Нужен openai_api_key в .cfg CursorAgent")
+                async with httpx.AsyncClient(timeout=120) as http:
+                    resp = await http.post(
+                        "https://api.openai.com/v1/images/generations",
+                        headers={"Authorization": f"Bearer {key}"},
+                        json={
+                            "model": "dall-e-3",
+                            "prompt": prompt,
+                            "n": 1,
+                            "size": "1024x1024",
+                        },
+                    )
+                    resp.raise_for_status()
+                    url = resp.json()["data"][0]["url"]
+                    img = await http.get(url)
+                    img.raise_for_status()
+                    return img.content
+
+            import httpx
+
+            url = (
+                "https://image.pollinations.ai/prompt/"
+                + urllib.parse.quote(prompt)
+                + "?width=1024&height=1024&nologo=true"
+            )
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as http:
+                resp = await http.get(url)
+                resp.raise_for_status()
+                return resp.content
+
+        async def _cmd_image(self, message: Message, prompt: str) -> None:
+            if not self._owner_only(message):
+                await utils.answer(message, self.strings("owner_only"))
+                return
+            if not prompt:
+                await utils.answer(
+                    message,
+                    "🎨 <b>Картинка</b>\n\n"
+                    "<code>.cursorimg кот в космосе</code>\n"
+                    "<code>.cursor img: закат над морем</code>\n"
+                    "<code>.cursor нарисуй: пиксельный дракон</code>",
+                )
+                return
+
+            await utils.answer(message, self.strings("img_generating"))
+            try:
+                data = await self._fetch_image_bytes(prompt)
+                caption = self.strings("img_caption").format(query=_quote(prompt))
+                await message.reply(file=data, message=caption)
+            except Exception as exc:
+                logger.exception("image generation failed")
+                await utils.answer(message, self.strings("error").format(_escape(str(exc))))
+
+        async def _cmd_ssh(self, message: Message, command: str) -> None:
+            if not self._owner_only(message):
+                await utils.answer(message, self.strings("owner_only"))
+                return
+            if not command:
+                await utils.answer(
+                    message,
+                    "🖥 <b>SSH</b>\n\n"
+                    "<code>.cursorssh ls -la</code>\n"
+                    "<code>.cursor ssh: df -h</code>\n"
+                    "<code>.cursor сервер: uptime</code>\n\n"
+                    "Настройка: <code>.cfg CursorAgent</code>",
+                )
+                return
+            if not self.config["ssh_enabled"]:
+                await utils.answer(message, self.strings("ssh_need_cfg"))
+                return
+
+            host = (self.config["ssh_host"] or "").strip()
+            user = (self.config["ssh_user"] or "").strip()
+            if not host or not user:
+                await utils.answer(message, self.strings("ssh_need_cfg"))
+                return
+
+            try:
+                import paramiko  # noqa: F401
+            except ImportError:
+                await utils.answer(message, self.strings("no_paramiko"))
+                return
+
+            await utils.answer(message, self.strings("ssh_running"))
+            try:
+                port = int(self.config["ssh_port"] or 22)
+                password = (self.config["ssh_password"] or "").strip()
+                key_path = (self.config["ssh_key_path"] or "").strip()
+                code, out, err = await utils.run_sync(
+                    self._ssh_exec,
+                    host,
+                    port,
+                    user,
+                    password,
+                    key_path,
+                    command,
+                )
+                body = out.strip() or err.strip() or "(пустой вывод)"
+                if code:
+                    body = f"exit {code}\n{body}"
+                reply = (
+                    "🖥 <b>SSH</b>\n\n"
+                    f"💬 <b>Команда</b>\n{_quote(command)}\n\n"
+                    f"✨ <b>Вывод</b>\n{_quote(body, expandable=True)}"
+                )
+                for chunk in _chunks(reply):
+                    await utils.answer(message, chunk)
+            except Exception as exc:
+                logger.exception("ssh failed")
+                await utils.answer(message, self.strings("error").format(_escape(str(exc))))
+
+        async def _dispatch(self, message: Message, prompt: str, *, chat: bool = False) -> None:
+            kind, payload = _parse_route(prompt)
+            if kind == "img":
+                await self._cmd_image(message, payload)
+            elif kind == "ssh":
+                await self._cmd_ssh(message, payload)
+            else:
+                await self._ask(message, payload, chat=chat)
+
         async def _ask(
             self,
             message: Message,
@@ -476,11 +726,21 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.1.2]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.2.0]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
                 return None
+
+        @loader.command(ru_doc="Картинка по описанию — .cursorimg")
+        async def cursorimgcmd(self, message: Message) -> None:
+            """Картинка по описанию — .cursorimg"""
+            await self._cmd_image(message, utils.get_args_raw(message))
+
+        @loader.command(ru_doc="Команда по SSH — .cursorssh")
+        async def cursorsshcmd(self, message: Message) -> None:
+            """Команда по SSH — .cursorssh"""
+            await self._cmd_ssh(message, utils.get_args_raw(message))
 
         @loader.command(ru_doc="Запрос к Cursor — .cursor <вопрос>")
         async def cursorcmd(self, message: Message) -> None:
@@ -489,19 +749,19 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.1.2</i>\n\n"
-                    "▫️ <code>.cursor &lt;вопрос&gt;</code> — запрос с контекстом чата\n"
+                    "🤖 <b>Cursor</b> <i>v1.2.0</i>\n\n"
+                    "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
+                    "▫️ <code>.cursor img: описание</code> — картинка\n"
+                    "▫️ <code>.cursor ssh: команда</code> — SSH на сервер\n"
+                    "▫️ <code>.cursorimg</code> / <code>.cursorssh</code>\n"
                     "▫️ <code>.cursorchat</code> — диалог\n"
-                    "▫️ <code>.cursorstop</code> — выход из диалога\n"
-                    "▫️ <code>.cursorwatch</code> — следить за чатом\n"
-                    "▫️ <code>.cursorunwatch</code> — не следить\n"
-                    "▫️ <code>.cursorwatchlist</code> — список чатов\n\n"
-                    "🔑 Ключ: <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a> "
-                    "→ <code>crsr_...</code>\n"
-                    "⚙️ <code>.cfg CursorAgent</code>",
+                    "▫️ <code>.cursorstop</code> — выход\n"
+                    "▫️ <code>.cursorwatch</code> — следить за чатом\n\n"
+                    "🔑 Cursor: <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a>\n"
+                    "⚙️ <code>.cfg CursorAgent</code> — ключи, SSH, картинки",
                 )
                 return
-            await self._ask(message, prompt)
+            await self._dispatch(message, prompt)
 
         @loader.command(ru_doc="Начать диалог — .cursorchat")
         async def cursorchatcmd(self, message: Message) -> None:
@@ -568,7 +828,7 @@ if loader:
             raw = (message.raw_text or "").strip()
             if not raw or raw.startswith("."):
                 return
-            await self._ask(message, raw, chat=True)
+            await self._dispatch(message, raw, chat=True)
 
         @loader.watcher(
             incoming=True,
