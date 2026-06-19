@@ -1,2 +1,5 @@
-# Только для модуля GiftSender (Hikka / Heroku / любой Telethon userbot)
+# Только для модулей Hikka / Heroku / Telethon userbot
 telethon>=1.38.0
+
+# Опционально для CursorAgent.py
+# cursor-sdk>=0.1.0

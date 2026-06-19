@@ -53,6 +53,33 @@ pip install -r requirements-hikka.txt
 
 ---
 
+## CursorAgent 🤖
+
+Модуль с [Cursor SDK](https://cursor.com/docs/sdk/python) — AI-агент из лички userbot'а.
+
+```text
+.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/CursorAgent.py
+```
+
+Настройка:
+
+```text
+.cfg CursorAgent
+```
+
+- `cursor_api_key` — ключ из [Cursor Dashboard → Integrations](https://cursor.com/dashboard/integrations)
+- `repo_url` / `repo_branch` — репозиторий для cloud-агента (по умолчанию giftbot)
+
+Команды:
+
+```text
+.cursor <вопрос>   — один запрос
+.cursorchat        — диалог (пиши сообщения, .cursorstop — выход)
+.cursorstop        — завершить диалог
+```
+
+---
+
 ## Поток `.gift`
 
 | Шаг | Действие |
