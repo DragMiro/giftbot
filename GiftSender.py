@@ -1,4 +1,4 @@
-# @version=1.1.3
+# @version=1.1.4
 # @description Отправка Telegram-подарков с текстом и premium emoji
 # @author giftbot
 # requires: telethon>=1.38.0
@@ -207,7 +207,7 @@ def split_text_parts(
     source: TextPart,
     parts_count: int,
     *,
-    by_words: bool = False,
+    by_words: bool = True,
 ) -> list[TextPart]:
     text = source.text.strip()
     if not text and not source.entities:
@@ -217,8 +217,9 @@ def split_text_parts(
     if parts_count == 1:
         return [TextPart(text=text, entities=list(source.entities))]
 
-    if by_words:
-        return _split_by_words(source, parts_count)
+    words = text.split()
+    if by_words and len(words) >= parts_count:
+        return _split_by_words(source, parts_count, words)
 
     total_utf16 = utf16_len(text)
     if parts_count > total_utf16:
@@ -236,15 +237,29 @@ def split_text_parts(
         end = start + size
         if i < parts_count - 1:
             end = _adjust_split_end(source.entities, end, total_utf16)
+            end = _snap_end_to_word_boundary(text, start, end, total_utf16)
+            if end <= start:
+                end = min(start + size, total_utf16)
         else:
             end = total_utf16
-        part_text = extract_utf16_slice(text, start, end)
+        part_text = extract_utf16_slice(text, start, end).strip()
         part_entities = _entities_in_range(source.entities, start, end)
-        if part_text.strip() or part_entities:
+        if part_text or part_entities:
             parts.append(TextPart(text=part_text, entities=part_entities))
         start = end
 
     return [p for p in parts if p.text.strip() or p.entities]
+
+
+def _snap_end_to_word_boundary(text: str, start_u: int, end_u: int, total: int) -> int:
+    if end_u >= total:
+        return total
+    start_py = utf16_to_py_index(text, start_u)
+    end_py = utf16_to_py_index(text, end_u)
+    last_space = text[start_py:end_py].rfind(" ")
+    if last_space > 0:
+        return py_index_to_utf16(text, start_py + last_space)
+    return end_u
 
 
 def _adjust_split_end(entities: list[EntityData], end: int, total: int) -> int:
@@ -272,37 +287,41 @@ def _entities_in_range(entities: list[EntityData], start: int, end: int) -> list
     return out
 
 
-def _split_by_words(source: TextPart, parts_count: int) -> list[TextPart]:
-    words = source.text.split()
-    if not words:
+def _word_utf16_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    pos_py = 0
+    for word in text.split():
+        start_py = text.find(word, pos_py)
+        if start_py < 0:
+            continue
+        end_py = start_py + len(word)
+        spans.append((py_index_to_utf16(text, start_py), py_index_to_utf16(text, end_py)))
+        pos_py = end_py
+    return spans
+
+
+def _split_by_words(source: TextPart, parts_count: int, words: list[str] | None = None) -> list[TextPart]:
+    text = source.text.strip()
+    word_spans = _word_utf16_spans(text)
+    if not word_spans:
         raise ValueError("Нет слов для разбиения")
-    if parts_count > len(words):
+    if parts_count > len(word_spans):
         raise ValueError(
-            f"Частей ({parts_count}) больше, чем слов ({len(words)}). "
+            f"Частей ({parts_count}) больше, чем слов ({len(word_spans)}). "
             "Уменьши число частей."
         )
-    chunk_size = len(words) // parts_count
-    remainder = len(words) % parts_count
+    chunk_size = len(word_spans) // parts_count
+    remainder = len(word_spans) % parts_count
     parts: list[TextPart] = []
     idx = 0
     for i in range(parts_count):
         size = chunk_size + (1 if i < remainder else 0)
-        chunk_words = words[idx : idx + size]
+        group = word_spans[idx : idx + size]
         idx += size
-        chunk_text = " ".join(chunk_words)
-        if not chunk_text:
-            continue
-        start_py = source.text.find(
-            chunk_words[0],
-            0 if not parts else source.text.find(parts[-1].text) + len(parts[-1].text),
-        )
-        if start_py < 0:
-            start_py = 0
-        end_py = start_py + len(chunk_text)
-        start_u = py_index_to_utf16(source.text, start_py)
-        end_u = py_index_to_utf16(source.text, end_py)
+        start_u, end_u = group[0][0], group[-1][1]
+        part_text = extract_utf16_slice(text, start_u, end_u)
         part_entities = _entities_in_range(source.entities, start_u, end_u)
-        parts.append(TextPart(text=chunk_text, entities=part_entities))
+        parts.append(TextPart(text=part_text, entities=part_entities))
     return parts
 
 
