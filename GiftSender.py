@@ -14,27 +14,53 @@
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import sys
+import urllib.request
 from pathlib import Path
+from types import ModuleType
 
 from telethon.tl.custom import Message
 
-# Репозиторий должен быть целиком на диске (git clone), не один файл.
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from core.entities import (  # noqa: E402
-    TextPart,
-    count_custom_emoji,
-    entities_from_telethon,
-    merge_message_parts,
-    preview_line,
-)
-from core.gifts import GiftCatalog, GiftSender  # noqa: E402
-from core.models import SendPlan  # noqa: E402
-from core.text_splitter import split_text_parts  # noqa: E402
+_CORE_RAW_URL = "https://raw.githubusercontent.com/DragMiro/giftbot/main/giftsender_core.py"
+
+
+def _load_giftsender_core() -> ModuleType:
+    try:
+        import giftsender_core as gc
+
+        return gc
+    except ImportError:
+        local = _ROOT / "giftsender_core.py"
+        if local.is_file():
+            spec = importlib.util.spec_from_file_location("giftsender_core", local)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["giftsender_core"] = mod
+            spec.loader.exec_module(mod)
+            return mod
+
+        src = urllib.request.urlopen(_CORE_RAW_URL, timeout=30).read().decode()
+        mod = ModuleType("giftsender_core")
+        exec(compile(src, _CORE_RAW_URL, "exec"), mod.__dict__)  # noqa: S102
+        sys.modules["giftsender_core"] = mod
+        return mod
+
+
+_gc = _load_giftsender_core()
+TextPart = _gc.TextPart
+count_custom_emoji = _gc.count_custom_emoji
+entities_from_telethon = _gc.entities_from_telethon
+merge_message_parts = _gc.merge_message_parts
+preview_line = _gc.preview_line
+GiftCatalog = _gc.GiftCatalog
+GiftSender = _gc.GiftSender
+SendPlan = _gc.SendPlan
+split_text_parts = _gc.split_text_parts
 
 logger = logging.getLogger(__name__)
 

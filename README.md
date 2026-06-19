@@ -30,14 +30,18 @@ pip install -r requirements-hikka.txt
 ```
 *(если репозиторий уже лежит в папке модулей)*
 
-**Через репозиторий Hikka:**
+**Через репозиторий (Hikka / Heroku):**
 ```text
-.addrepo https://github.com/DragMiro/giftbot
-.dlmod GiftSender
+.addrepo https://raw.githubusercontent.com/DragMiro/giftbot/main
+.dlm GiftSender
 ```
 
-> ⚠️ Модуль импортирует пакет `core/` из этого же репозитория.  
-> Нужен **полный clone**, не один файл с raw.githubusercontent.com.
+Или одной командой:
+```text
+.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/GiftSender.py
+```
+
+> При `.dlm` библиотека `giftsender_core.py` подтягивается автоматически с GitHub.
 
 ### 3. Используй
 

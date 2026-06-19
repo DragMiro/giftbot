@@ -45,14 +45,20 @@ Heroku использует тот же формат модулей, что Hikk
 
 ---
 
-## addrepo (Hikka)
-
-Если поддерживается добавление репозитория:
+## addrepo (Hikka / Heroku)
 
 ```text
-.addrepo https://github.com/DragMiro/giftbot
-.dlmod GiftSender
+.addrepo https://raw.githubusercontent.com/DragMiro/giftbot/main
+.dlm GiftSender
 ```
+
+Или без addrepo:
+
+```text
+.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/GiftSender.py
+```
+
+> URL должен быть `raw.githubusercontent.com`, не `github.com/...` — иначе Heroku не сможет разобрать ссылку.
 
 ---
 
@@ -60,7 +66,8 @@ Heroku использует тот же формат модулей, что Hikk
 
 | Ошибка | Решение |
 |--------|---------|
-| `No module named 'core'` | Загрузи модуль из **полного clone**, не один файл |
+| `expected 4, got 2` при `.dlm` | Используй `raw.githubusercontent.com`, не `github.com/DragMiro/giftbot` |
+| `No module named 'core'` | Обнови модуль: `.dlm GiftSender` или `.loadmod` из полного clone |
 | `BALANCE_TOO_LOW` | Пополни Stars на аккаунте userbot |
 | Premium emoji не отображаются | Вставляй emoji в текст сообщения userbot'у, не plain text |
 
