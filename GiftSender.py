@@ -1,4 +1,4 @@
-# @version=1.1.2
+# @version=1.1.3
 # @description Отправка Telegram-подарков с текстом и premium emoji
 # @author giftbot
 # requires: telethon>=1.38.0
@@ -445,12 +445,15 @@ class _Flow:
 
 if loader:
 
-    @loader.tds
     class GiftSenderMod(loader.Module):
         """🎁 Подарки с текстом и premium emoji"""
 
         strings = {
             "name": "GiftSender",
+            "_cls_doc": "🎁 Подарки с текстом и premium emoji",
+            "_cmd_doc_gift": "Мастер отправки подарков — .gift",
+            "_cmd_doc_giftcancel": "Отменить мастер — .giftcancel",
+            "_cmd_doc_giftdone": "Завершить ввод текста — .giftdone",
             "done_hint": "Готово. /done или .giftdone",
             "cancelled": "Отменено.",
         }
@@ -458,6 +461,9 @@ if loader:
         strings_ru = {
             "name": "GiftSender",
             "_cls_doc": "🎁 Подарки с текстом и premium emoji",
+            "_cmd_doc_gift": "Мастер отправки подарков — .gift",
+            "_cmd_doc_giftcancel": "Отменить мастер — .giftcancel",
+            "_cmd_doc_giftdone": "Завершить ввод текста — .giftdone",
             "done_hint": "Готово. /done или .giftdone",
             "cancelled": "Отменено.",
         }
