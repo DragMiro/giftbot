@@ -1,4 +1,4 @@
-# @version=1.1.1
+# @version=1.1.2
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -236,19 +236,20 @@ if loader:
                 loader.ConfigValue(
                     "context_messages",
                     20,
-                    lambda v: max(5, min(50, int(v))),
-                    "Сколько последних сообщений читать для контекста",
+                    lambda: "Сколько последних сообщений читать для контекста",
+                    validator=loader.validators.Integer(minimum=5, maximum=50),
                 ),
                 loader.ConfigValue(
                     "proactive_enabled",
                     True,
                     lambda: "Предлагать помощь в чатах под наблюдением",
+                    validator=loader.validators.Boolean(),
                 ),
                 loader.ConfigValue(
                     "proactive_cooldown",
                     300,
-                    lambda v: max(60, int(v)),
-                    "Пауза между подсказками в одном чате (сек)",
+                    lambda: "Пауза между подсказками в одном чате (сек)",
+                    validator=loader.validators.Integer(minimum=60),
                 ),
             )
 
@@ -475,7 +476,7 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.1.1]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.1.2]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -488,7 +489,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.1.1</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.1.2</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — запрос с контекстом чата\n"
                     "▫️ <code>.cursorchat</code> — диалог\n"
                     "▫️ <code>.cursorstop</code> — выход из диалога\n"
