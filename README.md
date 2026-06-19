@@ -12,7 +12,7 @@
 ### 1. Склонируй репозиторий на сервер / VPS
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/giftbot.git
+git clone https://github.com/DragMiro/giftbot.git
 cd giftbot
 pip install -r requirements-hikka.txt
 ```
@@ -32,7 +32,7 @@ pip install -r requirements-hikka.txt
 
 **Через репозиторий Hikka:**
 ```text
-.addrepo https://github.com/YOUR_USERNAME/giftbot
+.addrepo https://github.com/DragMiro/giftbot
 .dlmod GiftSender
 ```
 

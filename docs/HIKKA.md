@@ -6,7 +6,7 @@
 2. Клонируй репо в удобное место:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/giftbot.git ~/giftbot
+git clone https://github.com/DragMiro/giftbot.git ~/giftbot
 ```
 
 3. В Telegram (личка с userbot):
@@ -50,7 +50,7 @@ Heroku использует тот же формат модулей, что Hikk
 Если поддерживается добавление репозитория:
 
 ```text
-.addrepo https://github.com/YOUR_USERNAME/giftbot
+.addrepo https://github.com/DragMiro/giftbot
 .dlmod GiftSender
 ```
 
