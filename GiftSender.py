@@ -1,4 +1,4 @@
-# @version=1.1.1
+# @version=1.1.2
 # @description Отправка Telegram-подарков с текстом и premium emoji
 # @author giftbot
 # requires: telethon>=1.38.0
@@ -456,6 +456,8 @@ if loader:
         }
 
         strings_ru = {
+            "name": "GiftSender",
+            "_cls_doc": "🎁 Подарки с текстом и premium emoji",
             "done_hint": "Готово. /done или .giftdone",
             "cancelled": "Отменено.",
         }
@@ -486,9 +488,9 @@ if loader:
         def _clear(self, uid: int) -> None:
             self._flows.pop(uid, None)
 
-        @loader.command(ru_doc="Отправить подарки с текстом и premium emoji")
+        @loader.command(ru_doc="Мастер отправки подарков — .gift")
         async def giftcmd(self, message: Message) -> None:
-            """Start gift wizard — .gift"""
+            """Мастер отправки подарков — .gift"""
             uid = message.sender_id
             self._clear(uid)
             flow = self._flow(uid)
@@ -505,14 +507,14 @@ if loader:
             flow._gift_list = gifts[:20]
             await utils.answer(message, "\n".join(lines))
 
-        @loader.command(ru_doc="Завершить ввод текста")
+        @loader.command(ru_doc="Завершить ввод текста — .giftdone")
         async def giftdonecmd(self, message: Message) -> None:
-            """Finish text input — .giftdone"""
+            """Завершить ввод текста — .giftdone"""
             await self._finish_text(message)
 
-        @loader.command(ru_doc="Отменить мастер подарков")
+        @loader.command(ru_doc="Отменить мастер — .giftcancel")
         async def giftcancelcmd(self, message: Message) -> None:
-            """Cancel — .giftcancel"""
+            """Отменить мастер — .giftcancel"""
             self._clear(message.sender_id)
             await utils.answer(message, self.strings("cancelled"))
 
