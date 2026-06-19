@@ -1,4 +1,4 @@
-# @version=1.1.0
+# @version=1.1.1
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -80,15 +80,18 @@ def _format_inline(text: str) -> str:
     return text
 
 
-def _format_cursor_reply(text: str, *, model: str, proactive: bool = False) -> str:
+def _quote(text: str, *, expandable: bool = False) -> str:
+    body = _escape((text or "").strip())
+    if not body:
+        body = "…"
+    if expandable or len(body) > 280:
+        return f"<blockquote expandable>{body}</blockquote>"
+    return f"<blockquote>{body}</blockquote>"
+
+
+def _format_answer_body(text: str) -> str:
     raw = (text or "").strip() or "(пустой ответ)"
     parts: list[str] = []
-
-    if proactive:
-        parts.append("💡 <b>Подсказка</b>")
-    else:
-        parts.append("🤖 <b>Cursor</b>")
-
     blocks = re.split(r"```(?:\w+)?\n?", raw)
     for idx, block in enumerate(blocks):
         block = block.strip()
@@ -103,8 +106,38 @@ def _format_cursor_reply(text: str, *, model: str, proactive: bool = False) -> s
                     continue
                 lines = [_format_inline(line) for line in para.split("\n")]
                 parts.append("\n".join(lines))
+    return "\n\n".join(parts)
 
-    parts.append(f"\n<i>— {_escape(model)}</i>")
+
+def _format_cursor_reply(
+    text: str,
+    *,
+    model: str,
+    query: str | None = None,
+    proactive: bool = False,
+) -> str:
+    parts: list[str] = []
+
+    if proactive:
+        parts.append("💡 <b>Подсказка</b>")
+        if query:
+            parts.append("💬 <b>Сообщение</b>")
+            parts.append(_quote(query))
+        parts.append("✨ <b>Предложение</b>")
+    else:
+        parts.append("🤖 <b>Cursor</b>")
+        if query:
+            parts.append("💬 <b>Запрос</b>")
+            parts.append(_quote(query))
+        parts.append("✨ <b>Ответ</b>")
+
+    answer = _format_answer_body(text)
+    if len((text or "").strip()) > 280:
+        parts.append(f"<blockquote expandable>{answer}</blockquote>")
+    else:
+        parts.append(f"<blockquote>{answer}</blockquote>")
+
+    parts.append(f"<i>— {_escape(model)}</i>")
     return "\n\n".join(parts)
 
 
@@ -292,9 +325,15 @@ if loader:
             message: Message,
             text: str,
             *,
+            query: str | None = None,
             proactive: bool = False,
         ) -> None:
-            body = _format_cursor_reply(text, model=self._model(), proactive=proactive)
+            body = _format_cursor_reply(
+                text,
+                model=self._model(),
+                query=query,
+                proactive=proactive,
+            )
             for chunk in _chunks(body):
                 await utils.answer(message, chunk)
 
@@ -423,11 +462,11 @@ if loader:
                 if proactive:
                     if not text or text.upper() == "SKIP":
                         return None
-                    await self._reply_text(message, text, proactive=True)
+                    await self._reply_text(message, text, query=prompt, proactive=True)
                     self._proactive_at[message.chat_id] = time.time()
                     return text
 
-                await self._reply_text(message, text or "(пустой ответ)")
+                await self._reply_text(message, text or "(пустой ответ)", query=prompt)
                 return text
             except Exception as exc:
                 name = type(exc).__name__
@@ -436,7 +475,7 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.1.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.1.1]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -449,7 +488,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.1.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.1.1</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — запрос с контекстом чата\n"
                     "▫️ <code>.cursorchat</code> — диалог\n"
                     "▫️ <code>.cursorstop</code> — выход из диалога\n"
