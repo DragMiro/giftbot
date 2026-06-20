@@ -1,4 +1,4 @@
-"""Библиотека Cursor SDK для GiftSender / CursorAgent (не Heroku-модуль)."""
+"""Библиотека Cursor SDK для GiftSender / CursorAgent."""
 
 from __future__ import annotations
 
@@ -213,11 +213,11 @@ _loader = _resolve_loader()
 
 if _loader:
 
-    class _Cursor_aiMod(_loader.Module):
-        """Пустой модуль-обёртка для Heroku .dlm (библиотека без команд)."""
+    class CursorAiLibMod(_loader.Module):
+        """Пустой модуль-обёртка — библиотека без команд."""
 
         strings = {
-            "name": "_cursor_ai",
+            "name": "CursorAiLib",
             "_cls_doc": "📚 Cursor library (без команд, не удаляй)",
         }
 
@@ -230,14 +230,14 @@ def register(name):  # noqa: ARG001 — Heroku .dlm по raw URL
     loader = _resolve_loader()
     if loader is None:
         raise ImportError("Heroku loader not available")
-    mod_cls = globals().get("_Cursor_aiMod")
+    mod_cls = globals().get("CursorAiLibMod")
     if mod_cls is not None:
         return mod_cls()
 
-    class _Cursor_aiModFallback(loader.Module):
-        strings = {"name": "_cursor_ai", "_cls_doc": "lib"}
+    class CursorAiLibModFallback(loader.Module):
+        strings = {"name": "CursorAiLib", "_cls_doc": "lib"}
 
         async def client_ready(self, client, db) -> None:  # noqa: ARG002
             pass
 
-    return _Cursor_aiModFallback()
+    return CursorAiLibModFallback()

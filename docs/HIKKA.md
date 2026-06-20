@@ -69,7 +69,8 @@ Heroku использует тот же формат модулей, что Hikk
 |--------|---------|
 | `expected 4, got 2` при `.dlm` | Используй `raw.githubusercontent.com`, не `github.com/DragMiro/giftbot` |
 | `No module named 'core'` | Обнови модуль: `.dlm GiftSender` или `.loadmod` из полного clone |
-| `Loading failed` | `.logs`. Удали старый `cursor_ai.py` (`.ulm cursor_ai`), поставь `_cursor_ai.py`, обнови GiftSender v1.2.2+ |
+| `Loading failed` | `.logs`. Сначала `.ulm cursor_ai` / `.ulm _cursor_ai`, потом `.dlm CursorAiLib` |
+| `Module not available in repo` | Модуль не в `full.txt`. Используй `.dlm CursorAiLib`, не `_cursor_ai` |
 | `BALANCE_TOO_LOW` | Пополни Stars на аккаунте userbot |
 | Premium emoji не отображаются | Вставляй emoji в текст сообщения userbot'у, не plain text |
 
@@ -88,28 +89,17 @@ Heroku использует тот же формат модулей, что Hikk
 
 ## Cursor + GiftSender (поиск песен)
 
-**Не используй raw URL для `_cursor_ai`** — только через addrepo:
-
 ```text
 .addrepo https://raw.githubusercontent.com/DragMiro/giftbot/main
-.dlm _cursor_ai
+.dlm CursorAiLib
 .dlm GiftSender
 .dlm CursorAgent
 .pip install cursor-sdk httpx
 .restart -f
 ```
 
-Если уже ошибся с URL и в логах `has no attribute 'register'`:
-
-```text
-.ulm cursor_ai
-.ulm _cursor_ai
-.restart -f
-```
-
-Потом снова через `.addrepo` (см. выше).
-
-> `_cursor_ai` — библиотека. В списке модулей висит пустышка — это нормально.
+> `CursorAiLib` — библиотека, в списке модулей без команд — это нормально.  
+> Список модулей репо задаётся в `full.txt` (только GiftSender, CursorAgent, CursorAiLib).
 
 ---
 

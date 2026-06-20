@@ -55,12 +55,15 @@ except ImportError:
     loader = None  # type: ignore[assignment]
 
 try:
-    from . import _cursor_ai as _cursor_ai
+    from . import CursorAiLib as _cursor_ai
 except ImportError:
     try:
-        from . import cursor_ai as _cursor_ai  # legacy filename
+        from . import _cursor_ai as _cursor_ai  # legacy
     except ImportError:
-        _cursor_ai = None  # type: ignore[assignment]
+        try:
+            from . import cursor_ai as _cursor_ai  # legacy
+        except ImportError:
+            _cursor_ai = None  # type: ignore[assignment]
 
 _SONG_PREFIX = re.compile(r"^(?:\.song|песня\s*[:\-])\s*(.+)$", re.IGNORECASE | re.DOTALL)
 
@@ -736,7 +739,7 @@ if loader:
             query: str,
         ) -> None:
             if not _cursor_ai:
-                await utils.answer(message, "Библиотека _cursor_ai.py не найдена. Обнови giftbot.")
+                await utils.answer(message, "Установи CursorAiLib: .dlm CursorAiLib")
                 return
             key = self._cursor_key()
             if not key:

@@ -36,12 +36,15 @@ except ImportError:
     loader = None  # type: ignore[assignment]
 
 try:
-    from . import _cursor_ai as _cursor_ai
+    from . import CursorAiLib as _cursor_ai
 except ImportError:
     try:
-        from . import cursor_ai as _cursor_ai  # legacy filename
+        from . import _cursor_ai as _cursor_ai  # legacy
     except ImportError:
-        _cursor_ai = None  # type: ignore[assignment]
+        try:
+            from . import cursor_ai as _cursor_ai  # legacy
+        except ImportError:
+            _cursor_ai = None  # type: ignore[assignment]
 
 _CONTEXT_HEADER = """Ты — умный помощник в Telegram userbot.
 Отвечай по-русски, кратко и по делу. Учитывай контекст чата: кто пишет, где, о чём разговор.
@@ -233,7 +236,7 @@ if loader:
                 "Старая версия? Сначала:\n"
                 "<code>.ulm CursorAgent</code>\n"
                 "<code>.addrepo https://raw.githubusercontent.com/DragMiro/giftbot/main</code>\n"
-                "<code>.dlm _cursor_ai</code>\n"
+                "<code>.dlm CursorAiLib</code>\n"
                 "<code>.dlm CursorAgent</code>\n"
                 "<code>.restart -f</code>"
             ),
