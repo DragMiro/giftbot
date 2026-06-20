@@ -1,10 +1,9 @@
-"""Общий клиент Cursor SDK для модулей Heroku/Hikka."""
+"""Библиотека Cursor SDK для GiftSender / CursorAgent (не Heroku-модуль)."""
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -193,22 +192,3 @@ async def analyze_image_openai(
         resp.raise_for_status()
         data = resp.json()
         return (data["choices"][0]["message"]["content"] or "").strip()
-
-
-try:
-    from .. import loader
-except ImportError:
-    loader = None  # type: ignore[assignment]
-
-if loader:
-
-    class Cursor_aiMod(loader.Module):
-        """Библиотека Cursor SDK — нужна GiftSender и CursorAgent."""
-
-        strings = {
-            "name": "cursor_ai",
-            "_cls_doc": "📚 Библиотека Cursor (не удаляй)",
-        }
-
-        async def client_ready(self, client, db) -> None:  # noqa: ARG002
-            pass

@@ -1,4 +1,4 @@
-# @version=1.2.1
+# @version=1.2.2
 # @description Отправка Telegram-подарков с текстом, premium emoji и поиском песен (Cursor)
 # @author giftbot
 # requires: telethon>=1.38.0
@@ -55,9 +55,12 @@ except ImportError:
     loader = None  # type: ignore[assignment]
 
 try:
-    import cursor_ai as _cursor_ai
+    from . import _cursor_ai as _cursor_ai
 except ImportError:
-    _cursor_ai = None  # type: ignore[assignment]
+    try:
+        from . import cursor_ai as _cursor_ai  # legacy filename
+    except ImportError:
+        _cursor_ai = None  # type: ignore[assignment]
 
 _SONG_PREFIX = re.compile(r"^(?:\.song|песня\s*[:\-])\s*(.+)$", re.IGNORECASE | re.DOTALL)
 
@@ -521,7 +524,6 @@ if loader:
                     "send_delay",
                     2.0,
                     lambda: "Задержка между подарками (сек)",
-                    validator=loader.validators.Float(minimum=0.5),
                 ),
                 loader.ConfigValue(
                     "cursor_api_key",
@@ -542,7 +544,7 @@ if loader:
 
         async def client_ready(self, client, db) -> None:  # noqa: ARG002
             self._catalog = GiftCatalog(client)
-            delay = self.config["send_delay"]
+            delay = max(0.5, float(self.config["send_delay"] or 2.0))
             self._sender = GiftSender(client, delay=delay)
 
         def _flow(self, uid: int) -> _Flow:
@@ -734,7 +736,7 @@ if loader:
             query: str,
         ) -> None:
             if not _cursor_ai:
-                await utils.answer(message, "Модуль cursor_ai.py не найден. Обнови репозиторий giftbot.")
+                await utils.answer(message, "Библиотека _cursor_ai.py не найдена. Обнови giftbot.")
                 return
             key = self._cursor_key()
             if not key:
