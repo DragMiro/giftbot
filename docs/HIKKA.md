@@ -88,18 +88,28 @@ Heroku использует тот же формат модулей, что Hikk
 
 ## Cursor + GiftSender (поиск песен)
 
-**Важно:** `cursor_ai.py` больше не используется — Heroku пытался загрузить его как модуль и падал.
+**Не используй raw URL для `_cursor_ai`** — только через addrepo:
 
 ```text
-.ulm cursor_ai
-.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/_cursor_ai.py
-.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/GiftSender.py
-.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/CursorAgent.py
+.addrepo https://raw.githubusercontent.com/DragMiro/giftbot/main
+.dlm _cursor_ai
+.dlm GiftSender
+.dlm CursorAgent
 .pip install cursor-sdk httpx
 .restart -f
 ```
 
-> `_cursor_ai.py` — библиотека (файл с `_` Heroku **не грузит** как модуль).
+Если уже ошибся с URL и в логах `has no attribute 'register'`:
+
+```text
+.ulm cursor_ai
+.ulm _cursor_ai
+.restart -f
+```
+
+Потом снова через `.addrepo` (см. выше).
+
+> `_cursor_ai` — библиотека. В списке модулей висит пустышка — это нормально.
 
 ---
 

@@ -192,3 +192,52 @@ async def analyze_image_openai(
         resp.raise_for_status()
         data = resp.json()
         return (data["choices"][0]["message"]["content"] or "").strip()
+
+
+def _resolve_loader():
+    try:
+        from .. import loader
+
+        return loader
+    except ImportError:
+        pass
+    try:
+        from heroku import loader
+
+        return loader
+    except ImportError:
+        return None
+
+
+_loader = _resolve_loader()
+
+if _loader:
+
+    class _Cursor_aiMod(_loader.Module):
+        """Пустой модуль-обёртка для Heroku .dlm (библиотека без команд)."""
+
+        strings = {
+            "name": "_cursor_ai",
+            "_cls_doc": "📚 Cursor library (без команд, не удаляй)",
+        }
+
+        async def client_ready(self, client, db) -> None:  # noqa: ARG002
+            pass
+
+
+def register(name):  # noqa: ARG001 — Heroku .dlm по raw URL
+    """Heroku вызывает register(), если не нашёл loader.Module в модуле."""
+    loader = _resolve_loader()
+    if loader is None:
+        raise ImportError("Heroku loader not available")
+    mod_cls = globals().get("_Cursor_aiMod")
+    if mod_cls is not None:
+        return mod_cls()
+
+    class _Cursor_aiModFallback(loader.Module):
+        strings = {"name": "_cursor_ai", "_cls_doc": "lib"}
+
+        async def client_ready(self, client, db) -> None:  # noqa: ARG002
+            pass
+
+    return _Cursor_aiModFallback()

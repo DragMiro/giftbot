@@ -232,9 +232,10 @@ if loader:
             "load_hint": (
                 "Старая версия? Сначала:\n"
                 "<code>.ulm CursorAgent</code>\n"
-                "<code>rm -f ~/.heroku/modules_cache/*.py</code>\n"
-                "<code>.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/_cursor_ai.py</code>\n"
-                "<code>.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/CursorAgent.py</code>"
+                "<code>.addrepo https://raw.githubusercontent.com/DragMiro/giftbot/main</code>\n"
+                "<code>.dlm _cursor_ai</code>\n"
+                "<code>.dlm CursorAgent</code>\n"
+                "<code>.restart -f</code>"
             ),
             "error": "❌ <b>Cursor</b>\n\n{}",
             "owner_only": "🔒 Только владелец userbot может это делать.",
