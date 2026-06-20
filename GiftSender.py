@@ -1,4 +1,4 @@
-# @version=1.2.0
+# @version=1.2.1
 # @description Отправка Telegram-подарков с текстом, premium emoji и поиском песен (Cursor)
 # @author giftbot
 # requires: telethon>=1.38.0
@@ -520,26 +520,23 @@ if loader:
                 loader.ConfigValue(
                     "send_delay",
                     2.0,
-                    lambda v: max(0.5, float(v)),
-                    "Задержка между подарками (сек)",
+                    lambda: "Задержка между подарками (сек)",
+                    validator=loader.validators.Float(minimum=0.5),
                 ),
                 loader.ConfigValue(
                     "cursor_api_key",
                     "",
-                    lambda v: str(v),
-                    "Cursor API key (Integrations)",
+                    lambda: "Cursor API key (crsr_... из Integrations)",
                 ),
                 loader.ConfigValue(
                     "cursor_model",
                     "composer-2.5",
-                    lambda v: str(v),
-                    "Модель Cursor",
+                    lambda: "Модель Cursor",
                 ),
                 loader.ConfigValue(
                     "cursor_repo_url",
                     "https://github.com/DragMiro/giftbot",
-                    lambda v: str(v),
-                    "GitHub repo для Cursor cloud agent",
+                    lambda: "GitHub repo для Cursor cloud agent",
                 ),
             )
 

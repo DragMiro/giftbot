@@ -69,6 +69,7 @@ Heroku использует тот же формат модулей, что Hikk
 |--------|---------|
 | `expected 4, got 2` при `.dlm` | Используй `raw.githubusercontent.com`, не `github.com/DragMiro/giftbot` |
 | `No module named 'core'` | Обнови модуль: `.dlm GiftSender` или `.loadmod` из полного clone |
+| `Loading failed` | Смотри `.logs`. Часто: старый `ConfigValue` (обнови GiftSender v1.2.1+) или `cursor_ai.py` без stub-модуля |
 | `BALANCE_TOO_LOW` | Пополни Stars на аккаунте userbot |
 | Premium emoji не отображаются | Вставляй emoji в текст сообщения userbot'у, не plain text |
 
@@ -85,7 +86,21 @@ Heroku использует тот же формат модулей, что Hikk
 
 ---
 
-## CursorAgent
+## Cursor + GiftSender (поиск песен)
+
+Сначала библиотека, потом модули:
+
+```text
+.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/cursor_ai.py
+.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/GiftSender.py
+.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/CursorAgent.py
+.pip install cursor-sdk httpx
+.restart -f
+```
+
+> `cursor_ai.py` — **библиотека**, не команды. Модуль `cursor_ai` в списке — это нормально.
+
+---
 
 ```text
 .dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/CursorAgent.py
