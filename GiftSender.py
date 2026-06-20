@@ -1,5 +1,5 @@
-# @version=1.1.4
-# @description Отправка Telegram-подарков с текстом и premium emoji
+# @version=1.2.0
+# @description Отправка Telegram-подарков с текстом, premium emoji и поиском песен (Cursor)
 # @author giftbot
 # requires: telethon>=1.38.0
 """GiftSender — модуль для Hikka / Heroku / Telethon userbot.
@@ -10,12 +10,15 @@
 Команды:
   .gift       — мастер отправки
   .giftcancel — отмена
+  .song       — песня через Cursor (в мастере)
 """
 
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -50,6 +53,13 @@ try:
     from .. import loader, utils
 except ImportError:
     loader = None  # type: ignore[assignment]
+
+try:
+    import cursor_ai as _cursor_ai
+except ImportError:
+    _cursor_ai = None  # type: ignore[assignment]
+
+_SONG_PREFIX = re.compile(r"^(?:\.song|песня\s*[:\-])\s*(.+)$", re.IGNORECASE | re.DOTALL)
 
 
 @dataclass(slots=True)
@@ -447,6 +457,7 @@ class _Flow:
         "text_chunks",
         "parts",
         "hide_name",
+        "song_lines",
         "_gift_list",
     )
 
@@ -459,6 +470,7 @@ class _Flow:
         self.text_chunks: list[tuple[str, list]] = []
         self.parts: list[TextPart] = []
         self.hide_name = False
+        self.song_lines: list[str] = []
         self._gift_list = []
 
 
@@ -473,8 +485,15 @@ if loader:
             "_cmd_doc_gift": "Мастер отправки подарков — .gift",
             "_cmd_doc_giftcancel": "Отменить мастер — .giftcancel",
             "_cmd_doc_giftdone": "Завершить ввод текста — .giftdone",
+            "_cmd_doc_giftsong": "Поиск песни через Cursor — .giftsong",
             "done_hint": "Готово. /done или .giftdone",
             "cancelled": "Отменено.",
+            "no_cursor": (
+                "🎵 Нужен Cursor API key.\n"
+                "<code>.cfg GiftSender</code> → <code>cursor_api_key</code>\n"
+                "<a href=\"https://cursor.com/dashboard/integrations\">Integrations</a>"
+            ),
+            "cursor_busy": "⏳ Cursor ищет песню и сортирует фразы...",
         }
 
         strings_ru = {
@@ -483,8 +502,14 @@ if loader:
             "_cmd_doc_gift": "Мастер отправки подарков — .gift",
             "_cmd_doc_giftcancel": "Отменить мастер — .giftcancel",
             "_cmd_doc_giftdone": "Завершить ввод текста — .giftdone",
+            "_cmd_doc_giftsong": "Поиск песни через Cursor — .giftsong",
             "done_hint": "Готово. /done или .giftdone",
             "cancelled": "Отменено.",
+            "no_cursor": (
+                "🎵 Нужен Cursor API key.\n"
+                "<code>.cfg GiftSender</code> → <code>cursor_api_key</code>"
+            ),
+            "cursor_busy": "⏳ Cursor ищет песню и сортирует фразы...",
         }
 
         def __init__(self) -> None:
@@ -497,6 +522,24 @@ if loader:
                     2.0,
                     lambda v: max(0.5, float(v)),
                     "Задержка между подарками (сек)",
+                ),
+                loader.ConfigValue(
+                    "cursor_api_key",
+                    "",
+                    lambda v: str(v),
+                    "Cursor API key (Integrations)",
+                ),
+                loader.ConfigValue(
+                    "cursor_model",
+                    "composer-2.5",
+                    lambda v: str(v),
+                    "Модель Cursor",
+                ),
+                loader.ConfigValue(
+                    "cursor_repo_url",
+                    "https://github.com/DragMiro/giftbot",
+                    lambda v: str(v),
+                    "GitHub repo для Cursor cloud agent",
                 ),
             )
 
@@ -512,6 +555,36 @@ if loader:
 
         def _clear(self, uid: int) -> None:
             self._flows.pop(uid, None)
+
+        def _cursor_key(self) -> str:
+            return (self.config["cursor_api_key"] or "").strip()
+
+        def _cursor_model(self) -> str:
+            return (self.config["cursor_model"] or "composer-2.5").strip()
+
+        def _cursor_repo(self) -> str:
+            return (self.config["cursor_repo_url"] or "https://github.com/DragMiro/giftbot").strip()
+
+        @loader.command(ru_doc="Поиск песни через Cursor — .giftsong")
+        async def giftsongcmd(self, message: Message) -> None:
+            """Поиск песни через Cursor — .giftsong"""
+            query = utils.get_args_raw(message)
+            if not query:
+                await utils.answer(
+                    message,
+                    "🎵 <code>.giftsong Исполнитель — Название</code>\n"
+                    "Или в мастере <code>.gift</code> выбери режим песни.",
+                )
+                return
+            uid = message.sender_id
+            flow = self._flows.get(uid)
+            if not flow or flow.step not in ("text_mode", "song_query"):
+                await utils.answer(
+                    message,
+                    "Сначала запусти <code>.gift</code>, выбери подарок и получателя.",
+                )
+                return
+            await self._cursor_song(message, flow, uid, query)
 
         @loader.command(ru_doc="Мастер отправки подарков — .gift")
         async def giftcmd(self, message: Message) -> None:
@@ -559,6 +632,16 @@ if loader:
                 await self._handle_gift_pick(message, flow, uid)
                 return
 
+            if flow.step == "text_mode":
+                await self._handle_text_mode(message, flow, uid, raw)
+                return
+
+            if flow.step == "song_query":
+                if not raw:
+                    return
+                await self._cursor_song(message, flow, uid, raw)
+                return
+
             if flow.step == "text" and raw.lower() in ("/done", ".giftdone", "готово"):
                 await self._finish_text(message)
                 return
@@ -576,13 +659,15 @@ if loader:
 
             if flow.step == "recipient":
                 flow.recipient = raw.lstrip("@")
-                flow.step = "text"
+                flow.step = "text_mode"
                 flow.text_chunks = []
+                flow.song_lines = []
                 await utils.answer(
                     message,
-                    "✍️ Текст для подарков.\n"
-                    "✨ Premium emoji — из клавиатуры Telegram.\n"
-                    "Несколькими сообщениями. /done — готово",
+                    "✍️ Как набрать текст для подарков?\n\n"
+                    "▫️ <code>1</code> — свой текст (premium emoji)\n"
+                    "▫️ <code>2</code> — песня через Cursor\n"
+                    "▫️ <code>.song Исполнитель — Название</code>",
                 )
             elif flow.step == "parts":
                 await self._handle_parts(message, flow, uid, raw)
@@ -610,6 +695,87 @@ if loader:
             extra = f"\n✨ Premium emoji: {emoji_n}" if emoji_n else ""
             await utils.answer(message, f"Текст принят.{extra}\nНа сколько частей разделить?")
 
+        async def _handle_text_mode(
+            self,
+            message: Message,
+            flow: _Flow,
+            uid: int,
+            raw: str,
+        ) -> None:
+            song_match = _SONG_PREFIX.match(raw)
+            if song_match:
+                await self._cursor_song(message, flow, uid, song_match.group(1).strip())
+                return
+
+            low = raw.lower().strip()
+            if low in ("2", "песня", "song", "cursor"):
+                flow.step = "song_query"
+                await utils.answer(message, "🎵 Напиши исполнителя и название песни:")
+                return
+
+            if low in ("1", "свой", "текст", "text"):
+                flow.step = "text"
+                flow.text_chunks = []
+                await utils.answer(
+                    message,
+                    "✍️ Текст для подарков.\n"
+                    "✨ Premium emoji — из клавиатуры Telegram.\n"
+                    "Несколькими сообщениями. /done — готово",
+                )
+                return
+
+            await utils.answer(
+                message,
+                "Ответь <code>1</code>, <code>2</code> или <code>.song Исполнитель — Название</code>",
+            )
+
+        async def _cursor_song(
+            self,
+            message: Message,
+            flow: _Flow,
+            uid: int,
+            query: str,
+        ) -> None:
+            if not _cursor_ai:
+                await utils.answer(message, "Модуль cursor_ai.py не найден. Обнови репозиторий giftbot.")
+                return
+            key = self._cursor_key()
+            if not key:
+                await utils.answer(message, self.strings("no_cursor"))
+                return
+
+            await utils.answer(message, self.strings("cursor_busy"))
+            try:
+                lines = await _cursor_ai.song_phrases(
+                    query,
+                    api_key=key,
+                    model=self._cursor_model(),
+                    repo_url=self._cursor_repo(),
+                )
+                lines = await _cursor_ai.sort_phrases(
+                    lines,
+                    api_key=key,
+                    model=self._cursor_model(),
+                    repo_url=self._cursor_repo(),
+                )
+            except Exception as exc:
+                logger.exception("cursor song failed")
+                await utils.answer(message, f"❌ {html.escape(str(exc))}")
+                return
+
+            flow.song_lines = lines
+            flow.parts = [TextPart(text=line, entities=[]) for line in lines]
+            flow.step = "confirm"
+            total = flow.gift_stars * len(lines)
+            preview = "\n".join(preview_line(i, p) for i, p in enumerate(flow.parts, 1))
+            await utils.answer(
+                message,
+                f"🎵 <b>{html.escape(query)}</b> — {len(lines)} фраз\n"
+                f"{flow.gift_title} × {len(lines)} = {total}⭐\n"
+                f"Кому: {flow.recipient}\n\n{preview}\n\n"
+                f"Отправить? (да/нет)",
+            )
+
         async def _handle_gift_pick(self, message: Message, flow: _Flow, uid: int) -> None:
             try:
                 num = int((message.raw_text or "").strip())
@@ -635,6 +801,20 @@ if loader:
             except ValueError as exc:
                 await utils.answer(message, str(exc))
                 return
+
+            key = self._cursor_key()
+            emoji_n = count_custom_emoji(source.entities)
+            if key and _cursor_ai and len(parts) >= 2 and emoji_n == 0:
+                try:
+                    sorted_texts = await _cursor_ai.sort_phrases(
+                        [p.text for p in parts],
+                        api_key=key,
+                        model=self._cursor_model(),
+                        repo_url=self._cursor_repo(),
+                    )
+                    parts = [TextPart(text=t, entities=[]) for t in sorted_texts]
+                except Exception:
+                    logger.exception("cursor sort failed")
 
             flow.parts = parts
             flow.step = "confirm"

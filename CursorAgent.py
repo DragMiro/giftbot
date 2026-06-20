@@ -1,5 +1,5 @@
-# @version=1.2.0
-# @description Cursor AI агент из Telegram (cloud)
+# @version=1.3.0
+# @description Cursor AI агент из Telegram (cloud, изображения)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
 
@@ -9,7 +9,7 @@
   .cursor ssh: ...  — команда на SSH-сервере
   .cursorimg        — картинка по описанию
   .cursorssh        — выполнить команду по SSH
-  .cursorchat       — диалог с агентом
+  .cursorchat       — диалог с агентом (можно слать фото)
   .cursorstop       — завершить диалог
   .cursorwatch      — следить за чатом и предлагать помощь
   .cursorunwatch    — перестать следить
@@ -34,6 +34,11 @@ try:
     from .. import loader, utils
 except ImportError:
     loader = None  # type: ignore[assignment]
+
+try:
+    import cursor_ai as _cursor_ai
+except ImportError:
+    _cursor_ai = None  # type: ignore[assignment]
 
 _CONTEXT_HEADER = """Ты — умный помощник в Telegram userbot.
 Отвечай по-русски, кратко и по делу. Учитывай контекст чата: кто пишет, где, о чём разговор.
@@ -203,7 +208,7 @@ if loader:
             "thinking": "⏳ <i>Cursor анализирует чат...</i>",
             "chat_on": (
                 "💬 <b>Диалог с Cursor</b>\n\n"
-                "Пиши сообщения — я учитываю контекст чата.\n"
+                "Пиши сообщения или присылай фото — учитываю контекст чата.\n"
                 "<code>.cursorstop</code> — выход"
             ),
             "chat_off": "✅ Диалог завершён.",
@@ -225,11 +230,18 @@ if loader:
                 "Старая версия? Сначала:\n"
                 "<code>.ulm CursorAgent</code>\n"
                 "<code>rm -f ~/.heroku/modules_cache/*.py</code>\n"
+                "<code>.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/cursor_ai.py</code>\n"
                 "<code>.dlm https://raw.githubusercontent.com/DragMiro/giftbot/main/CursorAgent.py</code>"
             ),
             "error": "❌ <b>Cursor</b>\n\n{}",
             "owner_only": "🔒 Только владелец userbot может это делать.",
             "img_generating": "🎨 <i>Генерирую картинку...</i>",
+            "img_analyzing": "📷 <i>Анализирую изображение...</i>",
+            "img_too_large": "❌ Изображение слишком большое (макс 4 МБ).",
+            "img_no_openai": (
+                "📷 Фото получено, но для анализа картинки нужен "
+                "<code>openai_api_key</code> в <code>.cfg CursorAgent</code>."
+            ),
             "img_caption": "🎨 <b>Картинка</b>\n\n💬 <b>Запрос</b>\n{query}",
             "ssh_running": "🖥 <i>Выполняю на сервере...</i>",
             "ssh_need_cfg": (
@@ -499,6 +511,66 @@ if loader:
             return message.sender_id == self.tg_id
 
         @staticmethod
+        def _is_image_message(message: Message) -> bool:
+            if message.photo:
+                return True
+            doc = message.document
+            mime = getattr(doc, "mime_type", None) or ""
+            return bool(doc and mime.startswith("image/"))
+
+        async def _download_image(self, message: Message) -> tuple[bytes, str]:
+            if message.photo:
+                data = await message.download_media(bytes)
+                return data, "image/jpeg"
+            doc = message.document
+            data = await message.download_media(bytes)
+            mime = getattr(doc, "mime_type", None) or "image/jpeg"
+            return data, mime
+
+        async def _ask_with_media(
+            self,
+            message: Message,
+            prompt: str,
+            *,
+            chat: bool = False,
+        ) -> None:
+            if not self._is_image_message(message):
+                await self._dispatch(message, prompt, chat=chat)
+                return
+
+            caption = (message.raw_text or "").strip()
+            user_prompt = caption or prompt or "Опиши изображение и ответь по контексту чата."
+
+            await utils.answer(message, self.strings("img_analyzing"))
+            try:
+                image_bytes, mime = await self._download_image(message)
+                if len(image_bytes) > 4 * 1024 * 1024:
+                    await utils.answer(message, self.strings("img_too_large"))
+                    return
+
+                openai_key = (self.config["openai_api_key"] or "").strip()
+                if openai_key and _cursor_ai:
+                    vision_text = await _cursor_ai.analyze_image_openai(
+                        image_bytes,
+                        user_prompt,
+                        api_key=openai_key,
+                        mime=mime,
+                    )
+                    enriched = f"{user_prompt}\n\n[Содержимое изображения]\n{vision_text}"
+                else:
+                    await utils.answer(message, self.strings("img_no_openai"))
+                    enriched = (
+                        f"{user_prompt}\n\n"
+                        "[Пользователь прислал изображение. "
+                        "Полный анализ недоступен без openai_api_key — ответь по подписи и контексту.]"
+                    )
+
+                await self._ask(message, enriched, chat=chat)
+            except Exception as exc:
+                logger.exception("image analyze failed")
+                await utils.answer(message, self.strings("error").format(_escape(str(exc))))
+
+        @staticmethod
         def _ssh_exec(
             host: str,
             port: int,
@@ -726,7 +798,7 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.2.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.3.0]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -746,18 +818,23 @@ if loader:
         async def cursorcmd(self, message: Message) -> None:
             """Запрос к Cursor — .cursor <вопрос>"""
             prompt = utils.get_args_raw(message)
+            if self._is_image_message(message):
+                await self._ask_with_media(message, prompt, chat=False)
+                return
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.2.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.3.0</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
+                    "▫️ Отправь фото с подписью — анализ изображения\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
                     "▫️ <code>.cursor ssh: команда</code> — SSH на сервер\n"
                     "▫️ <code>.cursorimg</code> / <code>.cursorssh</code>\n"
-                    "▫️ <code>.cursorchat</code> — диалог\n"
+                    "▫️ <code>.cursorchat</code> — диалог (можно слать фото)\n"
                     "▫️ <code>.cursorstop</code> — выход\n"
                     "▫️ <code>.cursorwatch</code> — следить за чатом\n\n"
                     "🔑 Cursor: <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a>\n"
+                    "📷 Vision: <code>openai_api_key</code> в <code>.cfg CursorAgent</code>\n"
                     "⚙️ <code>.cfg CursorAgent</code> — ключи, SSH, картинки",
                 )
                 return
@@ -826,6 +903,9 @@ if loader:
             if uid not in self._chat_users:
                 return
             raw = (message.raw_text or "").strip()
+            if self._is_image_message(message):
+                await self._ask_with_media(message, raw, chat=True)
+                return
             if not raw or raw.startswith("."):
                 return
             await self._dispatch(message, raw, chat=True)
