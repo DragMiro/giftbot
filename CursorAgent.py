@@ -1,4 +1,4 @@
-# @version=1.2.0
+# @version=1.3.0
 # @description Cursor AI агент из Telegram (cloud)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -7,6 +7,7 @@
   .cursor <вопрос>  — запрос с контекстом чата
   .cursor img: ...  — генерация картинки
   .cursor ssh: ...  — команда на SSH-сервере
+  .cursorupload     — загрузить фото на URL
   .cursorimg        — картинка по описанию
   .cursorssh        — выполнить команду по SSH
   .cursorchat       — диалог с агентом
@@ -24,6 +25,7 @@ import time
 import urllib.parse
 
 from telethon.tl.custom import Message
+from telethon.tl.types import MessageEntityTextUrl, MessageEntityUrl
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +72,18 @@ _SSH_PREFIX = re.compile(
     r"^(?:ssh|сервер|server)\s*[:\-]\s*(.+)$",
     re.IGNORECASE | re.DOTALL,
 )
+_UPLOAD_PREFIX = re.compile(
+    r"^(?:upload|залей|загрузи|выложи)\s*[:\-]?\s*(https?://\S+)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_URL_RE = re.compile(r"https?://[^\s<>\"\]]+", re.IGNORECASE)
 
 
 def _parse_route(prompt: str) -> tuple[str, str]:
     text = (prompt or "").strip()
+    upload = _UPLOAD_PREFIX.match(text)
+    if upload:
+        return "upload", upload.group(1).strip()
     for pattern, kind in ((_IMG_PREFIX, "img"), (_SSH_PREFIX, "ssh")):
         match = pattern.match(text)
         if match:
@@ -194,6 +204,7 @@ if loader:
             "_cmd_doc_cursorunwatch": "Не следить — .cursorunwatch",
             "_cmd_doc_cursorimg": "Картинка по описанию — .cursorimg",
             "_cmd_doc_cursorssh": "Команда по SSH — .cursorssh",
+            "_cmd_doc_cursorupload": "Загрузить фото по URL — .cursorupload",
             "no_key": (
                 "🔑 <b>Нужен Cursor API key</b>\n\n"
                 "1. <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a>\n"
@@ -242,6 +253,22 @@ if loader:
             "no_paramiko": (
                 "Нет <code>paramiko</code>.\n"
                 "<code>.terminal pip install paramiko</code>"
+            ),
+            "upload_running": "📤 <i>Загружаю фото...</i>",
+            "upload_no_photo": (
+                "📤 <b>Загрузка фото</b>\n\n"
+                "Приложи фото к сообщению или ответь на фото.\n"
+                "<code>.cursorupload https://example.com/upload</code>"
+            ),
+            "upload_no_url": (
+                "📤 <b>Загрузка фото</b>\n\n"
+                "Укажи URL в тексте:\n"
+                "<code>.cursorupload https://example.com/upload</code>"
+            ),
+            "upload_ok": (
+                "📤 <b>Фото загружено</b>\n\n"
+                "🔗 <b>URL</b>\n{url}\n\n"
+                "✨ <b>Ответ сервера</b>\n{body}"
             ),
         }
 
@@ -534,6 +561,87 @@ if loader:
             finally:
                 client.close()
 
+        def _urls_from_message(self, message: Message, prompt: str = "") -> list[str]:
+            urls: list[str] = []
+            for source in (prompt, message.raw_text or ""):
+                urls.extend(_URL_RE.findall(source))
+            text = message.raw_text or ""
+            for ent in message.entities or []:
+                if isinstance(ent, MessageEntityTextUrl):
+                    urls.append(ent.url)
+                elif isinstance(ent, MessageEntityUrl) and text:
+                    urls.append(text[ent.offset : ent.offset + ent.length])
+            seen: set[str] = set()
+            unique: list[str] = []
+            for url in urls:
+                clean = url.rstrip(".,);]")
+                if clean not in seen:
+                    seen.add(clean)
+                    unique.append(clean)
+            return unique
+
+        async def _photo_source(self, message: Message) -> Message | None:
+            if message.photo:
+                return message
+            if message.reply_to_msg_id:
+                replied = await message.get_reply_message()
+                if replied and replied.photo:
+                    return replied
+            return None
+
+        async def _download_photo_bytes(self, message: Message) -> tuple[bytes, str]:
+            source = await self._photo_source(message)
+            if source is None:
+                raise RuntimeError("no photo")
+            data = await self.client.download_media(source, bytes)
+            if not data:
+                raise RuntimeError("empty photo")
+            ext = "jpg"
+            doc = getattr(source, "document", None)
+            if doc and getattr(doc, "mime_type", None):
+                mime = doc.mime_type.lower()
+                if "png" in mime:
+                    ext = "png"
+                elif "webp" in mime:
+                    ext = "webp"
+            return data, f"photo.{ext}"
+
+        async def _upload_photo_bytes(self, url: str, data: bytes, filename: str) -> tuple[int, str]:
+            import httpx
+
+            mime = "image/jpeg"
+            if filename.endswith(".png"):
+                mime = "image/png"
+            elif filename.endswith(".webp"):
+                mime = "image/webp"
+
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as http:
+                last_error = ""
+                for field in ("file", "image", "photo", "upload", "picture"):
+                    try:
+                        resp = await http.post(
+                            url,
+                            files={field: (filename, data, mime)},
+                        )
+                        body = (resp.text or "").strip()
+                        if resp.status_code < 400:
+                            return resp.status_code, body[:1500] or "(пустой ответ)"
+                        last_error = f"HTTP {resp.status_code}: {body[:300]}"
+                    except Exception as exc:
+                        last_error = str(exc)
+
+                resp = await http.post(
+                    url,
+                    content=data,
+                    headers={"Content-Type": mime},
+                )
+                body = (resp.text or "").strip()
+                if resp.status_code < 400:
+                    return resp.status_code, body[:1500] or "(пустой ответ)"
+                if last_error:
+                    raise RuntimeError(last_error)
+                raise RuntimeError(f"HTTP {resp.status_code}: {body[:300]}")
+
         async def _fetch_image_bytes(self, prompt: str) -> bytes:
             provider = (self.config["image_provider"] or "pollinations").strip().lower()
 
@@ -653,14 +761,54 @@ if loader:
                 logger.exception("ssh failed")
                 await utils.answer(message, self.strings("error").format(_escape(str(exc))))
 
+        async def _cmd_upload(self, message: Message, url: str | None = None, *, prompt: str = "") -> None:
+            if not self._owner_only(message):
+                await utils.answer(message, self.strings("owner_only"))
+                return
+
+            target = (url or "").strip()
+            if not target:
+                urls = self._urls_from_message(message, prompt)
+                target = urls[0] if urls else ""
+
+            if not target:
+                await utils.answer(message, self.strings("upload_no_url"))
+                return
+
+            if await self._photo_source(message) is None:
+                await utils.answer(message, self.strings("upload_no_photo"))
+                return
+
+            await utils.answer(message, self.strings("upload_running"))
+            try:
+                data, filename = await self._download_photo_bytes(message)
+                status, body = await self._upload_photo_bytes(target, data, filename)
+                reply = self.strings("upload_ok").format(
+                    url=_quote(target),
+                    body=_quote(f"HTTP {status}\n{body}", expandable=True),
+                )
+                for chunk in _chunks(reply):
+                    await utils.answer(message, chunk)
+            except Exception as exc:
+                logger.exception("photo upload failed")
+                await utils.answer(message, self.strings("error").format(_escape(str(exc))))
+
         async def _dispatch(self, message: Message, prompt: str, *, chat: bool = False) -> None:
+            if await self._photo_source(message) is not None:
+                urls = self._urls_from_message(message, prompt)
+                if urls:
+                    await self._cmd_upload(message, urls[0], prompt=prompt)
+                    return
+
             kind, payload = _parse_route(prompt)
             if kind == "img":
                 await self._cmd_image(message, payload)
             elif kind == "ssh":
                 await self._cmd_ssh(message, payload)
+            elif kind == "upload":
+                await self._cmd_upload(message, payload, prompt=prompt)
             else:
-                await self._ask(message, payload, chat=chat)
+                await self._ask(message, prompt, chat=chat)
 
         async def _ask(
             self,
@@ -726,11 +874,24 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.2.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.3.0]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
                 return None
+
+        @loader.command(ru_doc="Загрузить фото по URL — .cursorupload")
+        async def cursoruploadcmd(self, message: Message) -> None:
+            """Загрузить фото по URL — .cursorupload"""
+            args = utils.get_args_raw(message)
+            url = ""
+            match = _UPLOAD_PREFIX.match(args.strip()) if args else None
+            if match:
+                url = match.group(1).strip()
+            elif args:
+                found = _URL_RE.findall(args)
+                url = found[0].rstrip(".,);]") if found else ""
+            await self._cmd_upload(message, url, prompt=args)
 
         @loader.command(ru_doc="Картинка по описанию — .cursorimg")
         async def cursorimgcmd(self, message: Message) -> None:
@@ -749,10 +910,11 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.2.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.3.0</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
                     "▫️ <code>.cursor ssh: команда</code> — SSH на сервер\n"
+                    "▫️ <code>.cursorupload &lt;url&gt;</code> — фото на URL\n"
                     "▫️ <code>.cursorimg</code> / <code>.cursorssh</code>\n"
                     "▫️ <code>.cursorchat</code> — диалог\n"
                     "▫️ <code>.cursorstop</code> — выход\n"
@@ -826,7 +988,7 @@ if loader:
             if uid not in self._chat_users:
                 return
             raw = (message.raw_text or "").strip()
-            if not raw or raw.startswith("."):
+            if (not raw and not message.photo) or (raw and raw.startswith(".")):
                 return
             await self._dispatch(message, raw, chat=True)
 
