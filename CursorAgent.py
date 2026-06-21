@@ -1,4 +1,4 @@
-# @version=1.3.0
+# @version=1.3.1
 # @description Cursor AI агент из Telegram (cloud, изображения)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -104,6 +104,79 @@ def _chunks(text: str, size: int = 3900) -> list[str]:
 
 def _escape(text: str) -> str:
     return html.escape(text or "", quote=False)
+
+
+def _unwrap_message(message):
+    """Heroku watcher иногда передаёт Event, а не Message."""
+    inner = getattr(message, "message", None)
+    if inner is not None and inner is not message and hasattr(inner, "id"):
+        return inner
+    return message
+
+
+def _msg_chat_id(message) -> int:
+    msg = _unwrap_message(message)
+    if utils:
+        try:
+            return utils.get_chat_id(msg)
+        except Exception:
+            pass
+    cid = getattr(msg, "chat_id", None)
+    if cid:
+        return cid
+    chat = getattr(msg, "chat", None)
+    if chat is not None:
+        return getattr(chat, "id", 0)
+    return getattr(message, "chat_id", 0) or 0
+
+
+def _msg_sender_id(message) -> int:
+    msg = _unwrap_message(message)
+    for obj in (msg, message):
+        sid = getattr(obj, "sender_id", None)
+        if sid:
+            return sid
+    if _msg_is_private(message):
+        cid = _msg_chat_id(message)
+        if cid:
+            return cid
+    for obj in (msg, message):
+        from_id = getattr(obj, "from_id", None)
+        if from_id is not None:
+            uid = getattr(from_id, "user_id", None)
+            if uid:
+                return uid
+        peer = getattr(obj, "peer_id", None)
+        if peer is not None:
+            uid = getattr(peer, "user_id", None)
+            if uid:
+                return uid
+    return 0
+
+
+def _msg_is_private(message) -> bool:
+    msg = _unwrap_message(message)
+    for obj in (msg, message):
+        val = getattr(obj, "is_private", None)
+        if val is not None:
+            return bool(val)
+        val = getattr(obj, "private", None)
+        if val is not None:
+            return bool(val)
+    peer = getattr(msg, "peer_id", None) or getattr(message, "peer_id", None)
+    if peer is not None:
+        return bool(getattr(peer, "user_id", None))
+    return False
+
+
+def _watcher_private(message) -> bool:
+    msg = _unwrap_message(message)
+    return _msg_is_private(message) and not getattr(msg, "out", False)
+
+
+def _watcher_group(message) -> bool:
+    msg = _unwrap_message(message)
+    return not _msg_is_private(message) and not getattr(msg, "out", False)
 
 
 def _format_inline(text: str) -> str:
@@ -228,8 +301,10 @@ if loader:
             "watch_list_empty": "Нет чатов под наблюдением. Включи: <code>.cursorwatch</code>",
             "no_sdk": (
                 "Нет пакета <code>cursor-sdk</code>.\n"
-                "В <code>.terminal</code>:\n"
-                "<code>pip install cursor-sdk</code>\n"
+                "Через «Системная команда»:\n"
+                "<code>python3 -m pip install cursor-sdk --break-system-packages</code>\n"
+                "Проверка:\n"
+                "<code>python3 -c \"import cursor_sdk; print('ok')\"</code>\n"
                 "Потом <code>.restart -f</code>"
             ),
             "load_hint": (
@@ -370,6 +445,13 @@ if loader:
 
                 return cursor_sdk
             except ImportError as exc:
+                import sys
+
+                logger.warning(
+                    "cursor_sdk import failed: %s (python=%s)",
+                    exc,
+                    sys.executable,
+                )
                 raise ImportError("cursor-sdk") from exc
 
         def _api_key(self) -> str:
@@ -500,7 +582,7 @@ if loader:
         def _should_offer_help(self, message: Message) -> bool:
             if getattr(message, "out", False):
                 return False
-            if message.sender_id == self.tg_id:
+            if _msg_sender_id(message) == self.tg_id:
                 return False
             text = (message.raw_text or "").strip()
             if len(text) < 8:
@@ -515,7 +597,7 @@ if loader:
             return time.time() - last >= cooldown
 
         def _owner_only(self, message: Message) -> bool:
-            return message.sender_id == self.tg_id
+            return _msg_sender_id(message) == self.tg_id
 
         @staticmethod
         def _is_image_message(message: Message) -> bool:
@@ -773,7 +855,7 @@ if loader:
                 bridge = await self._ensure_bridge()
 
                 if chat:
-                    agent = await self._get_agent(message.sender_id)
+                    agent = await self._get_agent(_msg_sender_id(message))
                     run = await agent.send(full_prompt)
                     result = await run.wait()
                 else:
@@ -793,7 +875,7 @@ if loader:
                     if not text or text.upper() == "SKIP":
                         return None
                     await self._reply_text(message, text, query=prompt, proactive=True)
-                    self._proactive_at[message.chat_id] = time.time()
+                    self._proactive_at[_msg_chat_id(message)] = time.time()
                     return text
 
                 await self._reply_text(message, text or "(пустой ответ)", query=prompt)
@@ -853,7 +935,7 @@ if loader:
             if not self._api_key():
                 await utils.answer(message, self.strings("no_key"))
                 return
-            uid = message.sender_id
+            uid = _msg_sender_id(message)
             await self._close_agent(uid)
             await self._get_agent(uid)
             self._chat_users.add(uid)
@@ -862,7 +944,7 @@ if loader:
         @loader.command(ru_doc="Завершить диалог — .cursorstop")
         async def cursorstopcmd(self, message: Message) -> None:
             """Завершить диалог — .cursorstop"""
-            await self._close_agent(message.sender_id)
+            await self._close_agent(_msg_sender_id(message))
             await utils.answer(message, self.strings("chat_off"))
 
         @loader.command(ru_doc="Следить за чатом — .cursorwatch")
@@ -875,14 +957,14 @@ if loader:
                     "Выполни команду прямо в нужном чате.",
                 )
                 return
-            self._watched_chats.add(message.chat_id)
+            self._watched_chats.add(_msg_chat_id(message))
             self._save_watched()
             await utils.answer(message, self.strings("watch_on"))
 
         @loader.command(ru_doc="Не следить — .cursorunwatch")
         async def cursorunwatchcmd(self, message: Message) -> None:
             """Не следить — .cursorunwatch"""
-            self._watched_chats.discard(message.chat_id)
+            self._watched_chats.discard(_msg_chat_id(message))
             self._save_watched()
             await utils.answer(message, self.strings("watch_off"))
 
@@ -903,10 +985,10 @@ if loader:
 
         @loader.watcher(
             incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            func=_watcher_private,
         )
         async def cursor_watcher(self, message: Message) -> None:
-            uid = message.sender_id
+            uid = _msg_sender_id(message)
             if uid not in self._chat_users:
                 return
             raw = (message.raw_text or "").strip()
@@ -919,18 +1001,18 @@ if loader:
 
         @loader.watcher(
             incoming=True,
-            func=lambda m: not m.is_private and not getattr(m, "out", False),
+            func=_watcher_group,
         )
         async def cursor_proactive_watcher(self, message: Message) -> None:
             if not self.config["proactive_enabled"]:
                 return
-            if message.chat_id not in self._watched_chats:
+            if _msg_chat_id(message) not in self._watched_chats:
                 return
             if not self._api_key():
                 return
             if not self._should_offer_help(message):
                 return
-            if not self._cooldown_ok(message.chat_id):
+            if not self._cooldown_ok(_msg_chat_id(message)):
                 return
             text = (message.raw_text or "").strip()
             await self._ask(message, text, proactive=True)
