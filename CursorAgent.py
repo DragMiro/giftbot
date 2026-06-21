@@ -1,5 +1,5 @@
-# @version=1.3.0
-# @description Cursor AI агент из Telegram (cloud, изображения)
+# @version=1.4.0
+# @description Cursor AI агент из Telegram (cloud, изображения, txt-ответы)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
 
@@ -22,6 +22,7 @@ import logging
 import re
 import time
 import urllib.parse
+from io import BytesIO
 
 from telethon.tl.custom import Message
 
@@ -92,7 +93,11 @@ def _parse_route(prompt: str) -> tuple[str, str]:
     return "ask", text
 
 
-def _chunks(text: str, size: int = 3900) -> list[str]:
+_TELEGRAM_MAX = 4096
+_CHUNK_SIZE = 3900
+
+
+def _chunks(text: str, size: int = _CHUNK_SIZE) -> list[str]:
     if len(text) <= size:
         return [text]
     parts: list[str] = []
@@ -171,6 +176,37 @@ def _format_cursor_reply(
     else:
         parts.append(f"<blockquote>{answer}</blockquote>")
 
+    parts.append(f"<i>— {_escape(model)}</i>")
+    return "\n\n".join(parts)
+
+
+def _format_cursor_reply_file_caption(
+    text: str,
+    *,
+    model: str,
+    query: str | None = None,
+    proactive: bool = False,
+) -> str:
+    parts: list[str] = []
+
+    if proactive:
+        parts.append("💡 <b>Подсказка</b>")
+        if query:
+            parts.append("💬 <b>Сообщение</b>")
+            parts.append(_quote(query))
+        parts.append("✨ <b>Предложение</b>")
+    else:
+        parts.append("🤖 <b>Cursor</b>")
+        if query:
+            parts.append("💬 <b>Запрос</b>")
+            parts.append(_quote(query))
+        parts.append("✨ <b>Ответ</b>")
+
+    char_count = len((text or "").strip())
+    parts.append(
+        f"📎 Ответ не помещается в сообщение ({char_count} симв.) — см. "
+        f"<code>cursor_answer.txt</code>"
+    )
     parts.append(f"<i>— {_escape(model)}</i>")
     return "\n\n".join(parts)
 
@@ -431,14 +467,34 @@ if loader:
             query: str | None = None,
             proactive: bool = False,
         ) -> None:
+            model = self._model()
             body = _format_cursor_reply(
                 text,
-                model=self._model(),
+                model=model,
                 query=query,
                 proactive=proactive,
             )
-            for chunk in _chunks(body):
-                await utils.answer(message, chunk)
+            if len(body) <= _TELEGRAM_MAX:
+                await utils.answer(message, body)
+                return
+
+            caption = _format_cursor_reply_file_caption(
+                text,
+                model=model,
+                query=query,
+                proactive=proactive,
+            )
+            if len(caption) > _TELEGRAM_MAX:
+                caption = _format_cursor_reply_file_caption(
+                    text,
+                    model=model,
+                    query=None,
+                    proactive=proactive,
+                )
+            file_body = (text or "").strip() or "(пустой ответ)"
+            bio = BytesIO(file_body.encode("utf-8"))
+            bio.name = "cursor_answer.txt"
+            await message.reply(file=bio, message=caption)
 
         async def _describe_chat(self, message: Message) -> list[str]:
             lines: list[str] = []
@@ -805,7 +861,7 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.3.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.4.0]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -831,7 +887,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.3.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.4.0</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
                     "▫️ Отправь фото с подписью — анализ изображения\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
