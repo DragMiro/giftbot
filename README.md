@@ -83,6 +83,8 @@ pip install -r requirements-hikka.txt
 .cursor <вопрос>   — один запрос
 .cursorchat        — диалог (пиши сообщения, .cursorstop — выход)
 .cursorstop        — завершить диалог
+.afkcursor         — AFK: ИИ-менеджер отвечает в личку за вас
+.afkcursor off     — выключить AFK
 ```
 
 ---
