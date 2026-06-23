@@ -250,9 +250,11 @@ if loader:
             "watch_list_empty": "Нет чатов под наблюдением. Включи: <code>.cursorwatch</code>",
             "no_sdk": (
                 "Нет пакета <code>cursor-sdk</code>.\n"
-                "В <code>.terminal</code>:\n"
-                "<code>pip install cursor-sdk</code>\n"
-                "Потом <code>.restart -f</code>"
+                "В Telegram (не через <code>.terminal</code>):\n"
+                "<code>.pip install cursor-sdk</code>\n"
+                "Потом <code>.restart -f</code>\n\n"
+                "Если <code>.pip</code> недоступен:\n"
+                "<code>.terminal pip install cursor-sdk --break-system-packages</code>"
             ),
             "load_hint": (
                 "Старая версия? Сначала:\n"
@@ -983,7 +985,9 @@ if loader:
 
                 if result.status == "error":
                     if not proactive:
-                        await utils.answer(message, self.strings("error").format("run failed"))
+                        detail = (result.result or "").strip()
+                        msg = detail or "run failed (проверь cursor_api_key и лимит подписки Cursor)"
+                        await utils.answer(message, self.strings("error").format(_escape(msg)))
                     return None
 
                 text = (result.result or "").strip()
