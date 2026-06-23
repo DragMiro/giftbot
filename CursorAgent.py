@@ -1,5 +1,5 @@
-# @version=1.5.0
-# @description Cursor AI агент из Telegram (cloud, изображения, AFK)
+# @version=1.6.0
+# @description Cursor AI агент из Telegram (cloud, изображения, AFK, Нанобот)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
 
@@ -15,16 +15,21 @@
   .cursorunwatch    — перестать следить
   .afkcursor        — AFK: ИИ-менеджер отвечает в личку за вас
   .afkcursor off    — выключить AFK
+  .nanobot          — персональный AI-ассистент аккаунта (как nanobot)
+  .nanobot off      — выключить ассистента
+  .nanobot remind   — напоминание
 """
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
 import re
 import time
 import urllib.parse
+from datetime import datetime, timedelta
 
 from telethon.tl.custom import Message
 
@@ -89,15 +94,61 @@ _AFK_HEADER = """Ты — ИИ-менеджер пользователя {owner_
 Новое сообщение от собеседника:
 """
 
+_ASSISTANT_HEADER = """Нанобот — это ты 🐱, персональный AI-ассистент владельца {owner_name} в Telegram userbot.
+Ты живёшь на его аккаунте и общаешься через Telegram (не на сервере — на userbot).
+
+Что ты по сути:
+• AI-агент с долгой памятью (блок MEMORY ниже + история чата)
+• Работаешь через Cursor LLM, можешь анализировать код и репозитории
+• Постоянно на связи, когда режим .nanobot включён
+
+Что умеешь через userbot:
+🤖 Аккаунт и модули
+• Подсказываешь Hikka-команды: .gift, .cursor, .dlm, .loadmod, .restart, .cfg
+• Помогаешь с GiftSender, CursorAgent, настройкой модулей
+• Объясняешь как ставить/обновлять модули с GitHub
+
+📁 Код и файлы
+• Через Cursor cloud анализируешь код, клонируешь репы, правишь баги
+• Правишь код только если владелец явно сказал «исправляй» / «делай»
+
+🎨 Картинки
+• Владелец может: img: описание — или .cursorimg
+
+🌐 Веб / поиск
+• Анализ ссылок, статей, документации через Cursor
+
+🔔 Напоминания
+• Владелец ставит: .nanobot remind 2h текст / .nanobot remind 09:00 текст
+
+Правила:
+1. Отвечай по-русски, кратко и по делу. Без markdown-списков в ответе — обычный текст.
+2. Ты общаешься только с владельцем ({owner_name}) — это его личный ассистент.
+3. Не выдумывай факты — опирайся на память, контекст и то, что реально умеет userbot.
+4. Опасные действия (удаление, массовая рассылка, смена настроек) — только после явного подтверждения.
+5. Если не знаешь — честно скажи. Максимум 1 emoji в начале.
+6. Важные факты о владельце запоминай: в конце ответа (если есть что запомнить) добавь строку:
+   MEMORY: краткая заметка для будущего (одна строка, без markdown)
+
+{memory_block}
+
+{context}
+
+---
+Сообщение владельца:
+"""
+
 _GUARDIAN_ERROR_HEADER = """Ты — страж модуля CursorAgent (Telegram userbot на Hikka/Heroku).
 Произошла ошибка. Проанализируй и верни ТОЛЬКО валидный JSON без markdown:
-{{"action":"retry"|"reset_bridge"|"disable_afk"|"pause_afk"|"alert_only"|"ignore","reason":"кратко","owner_message":"сообщение владельцу на русском"}}
+{{"action":"retry"|"reset_bridge"|"disable_afk"|"pause_afk"|"disable_assistant"|"pause_assistant"|"alert_only"|"ignore","reason":"кратко","owner_message":"сообщение владельцу на русском"}}
 
 Доступные action:
 - retry — безопасно повторить запрос (1 раз)
 - reset_bridge — сбросить мост Cursor SDK
 - disable_afk — выключить AFK-режим
 - pause_afk — временно остановить AFK-ответы
+- disable_assistant — выключить режим .nanobot
+- pause_assistant — временно остановить ответы ассистента
 - alert_only — только уведомить владельца, не чинить самому
 - ignore — ничего не делать
 
@@ -118,6 +169,12 @@ proceed=true только если это нормальная нагрузка.
 
 _YES_RE = re.compile(r"^(?:да|yes|y|\+|ok|ок|выполн|продолж|разреши)\b", re.IGNORECASE)
 _NO_RE = re.compile(r"^(?:нет|no|n|\-|стоп|stop|отмен|запрет|не\s*выполн)\b", re.IGNORECASE)
+_MEMORY_RE = re.compile(r"(?:^|\n)MEMORY:\s*(.+?)(?:\n|$)", re.IGNORECASE | re.DOTALL)
+_REMIND_REL_RE = re.compile(
+    r"^(?:(?:через|in)\s+)?(\d+)\s*(s|сек|с|sec|m|мин|минут|minute|h|ч|час|hour|d|д|день|day|w|нед|week)s?\b",
+    re.IGNORECASE,
+)
+_REMIND_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})(?:\s+(.+))?$")
 
 _HELP_TRIGGERS = re.compile(
     r"(?:\?|помоги|помощь|не работает|ошибк|баг|как сделать|как настроить|"
@@ -258,6 +315,7 @@ if loader:
             "_cmd_doc_cursorimg": "Картинка по описанию — .cursorimg",
             "_cmd_doc_cursorssh": "Команда по SSH — .cursorssh",
             "_cmd_doc_afkcursor": "AFK: ИИ-менеджер отвечает в личку — .afkcursor",
+            "_cmd_doc_nanobot": "Персональный AI-ассистент аккаунта — .nanobot",
             "no_key": (
                 "🔑 <b>Нужен Cursor API key</b>\n\n"
                 "1. <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a>\n"
@@ -329,6 +387,30 @@ if loader:
                 "🌙 AFK уже включён.\n"
                 "<code>.afkcursor off</code> — выключить"
             ),
+            "nanobot_on": (
+                "🐱 <b>Нанобот включён</b>\n\n"
+                "Пиши мне в <b>Избранном</b> (Saved Messages) — я твой персональный ассистент.\n"
+                "Помню контекст, умею код, картинки, напоминания.\n"
+                "Страж следит за безопасностью.\n\n"
+                "<code>.nanobot off</code> — выключить\n"
+                "<code>.nanobot memory</code> — показать память\n"
+                "<code>.nanobot remind 2h текст</code> — напоминание"
+            ),
+            "nanobot_off": "🐱 Нанобот выключен.",
+            "nanobot_already": (
+                "🐱 Нанобот уже включён.\n"
+                "<code>.nanobot off</code> — выключить"
+            ),
+            "nanobot_memory_empty": "🧠 Память пуста. Я буду запоминать важное по ходу общения.",
+            "nanobot_memory_cleared": "🧠 Память очищена.",
+            "nanobot_remind_ok": "🔔 Напоминание на <b>{when}</b>:\n{quote}",
+            "nanobot_remind_bad": (
+                "🔔 <b>Напоминание</b>\n\n"
+                "<code>.nanobot remind 2h позвонить</code>\n"
+                "<code>.nanobot remind 30m текст</code>\n"
+                "<code>.nanobot remind 09:00 утренняя зарядка</code>\n"
+                "<code>.nanobot remind 1d поздравить</code>"
+            ),
         }
 
         strings_ru = strings.copy()
@@ -342,6 +424,12 @@ if loader:
             self._afk_enabled_at: float = 0.0
             self._afk_at: dict[int, float] = {}
             self._afk_blocked: bool = False
+            self._assistant_enabled: bool = False
+            self._assistant_blocked: bool = False
+            self._assistant_at: dict[int, float] = {}
+            self._assistant_memory: str = ""
+            self._assistant_reminders: list[dict] = []
+            self._reminder_task: asyncio.Task | None = None
             self._outgoing_log: list[tuple[float, str]] = []
             self._guardian_pending: dict[int, dict] = {}
             self._guardian_last_alert: float = 0.0
@@ -469,6 +557,29 @@ if loader:
                     lambda: "Окно подсчёта исходящих (сек)",
                     validator=loader.validators.Integer(minimum=10, maximum=600),
                 ),
+                loader.ConfigValue(
+                    "assistant_history_messages",
+                    40,
+                    lambda: "Сколько сообщений истории читать в режиме .nanobot",
+                    validator=loader.validators.Integer(minimum=10, maximum=100),
+                ),
+                loader.ConfigValue(
+                    "assistant_cooldown",
+                    2,
+                    lambda: "Пауза между ответами ассистента (сек)",
+                    validator=loader.validators.Integer(minimum=0),
+                ),
+                loader.ConfigValue(
+                    "assistant_saved_only",
+                    True,
+                    lambda: "Отвечать только в Избранном (Saved Messages)",
+                    validator=loader.validators.Boolean(),
+                ),
+                loader.ConfigValue(
+                    "assistant_system_prompt",
+                    "",
+                    lambda: "Кастомный system prompt (пусто = встроенный Нанобот)",
+                ),
             )
 
         async def client_ready(self, client, db) -> None:  # noqa: ARG002
@@ -482,6 +593,132 @@ if loader:
             if self._afk_enabled and self._afk_enabled_at <= 0:
                 self._afk_enabled_at = time.time()
                 self._save_afk()
+            self._assistant_enabled = bool(
+                self._db.get(self.strings("name"), "assistant_enabled", False)
+            )
+            self._assistant_memory = str(
+                self._db.get(self.strings("name"), "assistant_memory", "") or ""
+            )
+            saved_reminders = self._db.get(self.strings("name"), "assistant_reminders", [])
+            if isinstance(saved_reminders, list):
+                self._assistant_reminders = [r for r in saved_reminders if isinstance(r, dict)]
+            if self._assistant_enabled:
+                self._start_reminder_loop()
+
+        def _save_assistant(self) -> None:
+            self._db.set(self.strings("name"), "assistant_enabled", self._assistant_enabled)
+            self._db.set(self.strings("name"), "assistant_memory", self._assistant_memory)
+
+        def _save_reminders(self) -> None:
+            self._db.set(self.strings("name"), "assistant_reminders", self._assistant_reminders)
+
+        def _start_reminder_loop(self) -> None:
+            if self._reminder_task and not self._reminder_task.done():
+                return
+            self._reminder_task = asyncio.create_task(self._reminder_loop())
+
+        def _stop_reminder_loop(self) -> None:
+            if self._reminder_task and not self._reminder_task.done():
+                self._reminder_task.cancel()
+            self._reminder_task = None
+
+        async def _reminder_loop(self) -> None:
+            try:
+                while self._assistant_enabled:
+                    await self._check_reminders()
+                    await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("reminder loop failed")
+
+        async def _check_reminders(self) -> None:
+            if not self._assistant_reminders:
+                return
+            now = time.time()
+            due: list[dict] = []
+            remaining: list[dict] = []
+            for item in self._assistant_reminders:
+                at = float(item.get("at", 0))
+                if at <= now:
+                    due.append(item)
+                else:
+                    remaining.append(item)
+            if not due:
+                return
+            self._assistant_reminders = remaining
+            self._save_reminders()
+            for item in due:
+                text = str(item.get("text", "")).strip() or "Напоминание"
+                chat_id = int(item.get("chat_id", self.tg_id))
+                body = f"🔔 <b>Напоминание</b>\n\n{_quote(text)}"
+                try:
+                    if not await self._guardian_check_outgoing("assistant"):
+                        self._assistant_reminders.append(item)
+                        self._save_reminders()
+                        continue
+                    await self.client.send_message(chat_id, body, parse_mode="html")
+                    await self._guardian_after_outgoing("assistant")
+                except Exception:
+                    logger.exception("reminder send failed")
+                    self._assistant_reminders.append(item)
+                    self._save_reminders()
+
+        def _parse_remind_time(self, raw: str) -> tuple[float | None, str]:
+            text = (raw or "").strip()
+            if not text:
+                return None, ""
+            rel = _REMIND_REL_RE.match(text)
+            if rel:
+                amount = int(rel.group(1))
+                unit = rel.group(2).lower()
+                seconds = amount
+                if unit in ("m", "мин", "минут", "minute"):
+                    seconds = amount * 60
+                elif unit in ("h", "ч", "час", "hour"):
+                    seconds = amount * 3600
+                elif unit in ("d", "д", "день", "day"):
+                    seconds = amount * 86400
+                elif unit in ("w", "нед", "week"):
+                    seconds = amount * 604800
+                rest = text[rel.end() :].strip()
+                return time.time() + seconds, rest
+            clock = _REMIND_TIME_RE.match(text)
+            if clock:
+                hour, minute = int(clock.group(1)), int(clock.group(2))
+                rest = (clock.group(3) or "").strip()
+                now = datetime.now()
+                target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if target <= now:
+                    target += timedelta(days=1)
+                return target.timestamp(), rest
+            return None, text
+
+        def _format_remind_when(self, ts: float) -> str:
+            return datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+
+        def _append_memory(self, note: str) -> None:
+            note = (note or "").strip()
+            if not note or len(note) > 500:
+                return
+            lines = [ln.strip() for ln in self._assistant_memory.splitlines() if ln.strip()]
+            if note in lines:
+                return
+            lines.append(note)
+            if len(lines) > 50:
+                lines = lines[-50:]
+            self._assistant_memory = "\n".join(lines)
+            self._save_assistant()
+
+        def _extract_memory_from_reply(self, text: str) -> str:
+            match = _MEMORY_RE.search(text or "")
+            if not match:
+                return (text or "").strip()
+            note = match.group(1).strip()
+            if note:
+                self._append_memory(note)
+            cleaned = _MEMORY_RE.sub("", text or "").strip()
+            return cleaned
 
         def _save_watched(self) -> None:
             self._db.set(self.strings("name"), "watched_chats", list(self._watched_chats))
@@ -778,6 +1015,161 @@ if loader:
             except Exception:
                 logger.exception("afk image failed")
 
+        def _assistant_cooldown_ok(self, chat_id: int) -> bool:
+            cooldown = int(self.config["assistant_cooldown"])
+            if cooldown <= 0:
+                return True
+            last = self._assistant_at.get(chat_id, 0.0)
+            return time.time() - last >= cooldown
+
+        def _should_assistant_reply(self, message: Message) -> bool:
+            if not self._assistant_enabled:
+                return False
+            if self._assistant_blocked:
+                return False
+            if not message.is_private:
+                return False
+            if not self._owner_only(message):
+                return False
+            if self.config["assistant_saved_only"] and message.chat_id != self.tg_id:
+                return False
+            text = (message.raw_text or "").strip()
+            if text.startswith(".") and not text.lower().startswith(".nanobot"):
+                return False
+            if not text and not self._is_image_message(message):
+                return False
+            return True
+
+        async def _build_assistant_context(self, message: Message) -> str:
+            try:
+                meta = await self._describe_chat(message)
+                limit = int(self.config["assistant_history_messages"])
+                history = await self._recent_messages(message, limit=limit)
+            except Exception:
+                logger.exception("assistant context failed")
+                return "Контекст чата недоступен."
+            parts = ["=== Контекст Telegram ===", *meta]
+            if history:
+                parts.append(f"\n=== Последние сообщения ({len(history)}) ===")
+                parts.extend(history)
+            return "\n".join(parts)
+
+        def _assistant_memory_block(self) -> str:
+            mem = (self._assistant_memory or "").strip()
+            if not mem:
+                return "=== MEMORY ===\n(пусто — запоминай важное через MEMORY: в ответах)"
+            return f"=== MEMORY ===\n{mem}"
+
+        def _wrap_assistant_prompt(self, prompt: str, context: str, owner_name: str) -> str:
+            custom = (self.config["assistant_system_prompt"] or "").strip()
+            if custom:
+                header = custom.replace("{owner_name}", owner_name)
+                header = header.replace("{memory_block}", self._assistant_memory_block())
+                header = header.replace("{context}", context)
+                return header + prompt
+            return _ASSISTANT_HEADER.format(
+                owner_name=owner_name,
+                memory_block=self._assistant_memory_block(),
+                context=context,
+            ) + prompt
+
+        async def _reply_assistant_plain(self, message: Message, text: str) -> None:
+            if not await self._guardian_check_outgoing("assistant"):
+                return
+            body = (text or "").strip()
+            if not body:
+                return
+            for chunk in _chunks(body, size=4000):
+                await message.reply(chunk)
+            await self._guardian_after_outgoing("assistant")
+
+        async def _ask_assistant(self, message: Message, prompt: str) -> None:
+            try:
+                cs = self._import_cursor_sdk()
+            except ImportError:
+                logger.warning("assistant: cursor-sdk not installed")
+                return
+            if not self._api_key():
+                logger.warning("assistant: no api key")
+                return
+            try:
+                me = await self.client.get_me()
+                owner_name = _person_name(me)
+                context = await self._build_assistant_context(message)
+                full_prompt = self._wrap_assistant_prompt(prompt, context, owner_name)
+                agent = await self._get_agent(self.tg_id)
+                run = await agent.send(full_prompt)
+                result = await run.wait()
+                if result.status == "error":
+                    detail = (result.result or "").strip() or "run failed"
+                    fix = await self._guardian_handle_error(
+                        detail,
+                        source="assistant",
+                        context={"chat_id": message.chat_id, "prompt": prompt[:200]},
+                    )
+                    if fix == "reset_bridge":
+                        await self._reset_cursor_bridge()
+                        agent = await self._get_agent(self.tg_id)
+                        run = await agent.send(full_prompt)
+                        result = await run.wait()
+                    elif fix == "retry":
+                        run = await agent.send(full_prompt)
+                        result = await run.wait()
+                    if result.status == "error":
+                        logger.warning("assistant: cursor run failed")
+                        return
+                text = self._extract_memory_from_reply((result.result or "").strip())
+                if not text:
+                    return
+                await self._reply_assistant_plain(message, text)
+                self._assistant_at[message.chat_id] = time.time()
+            except Exception as exc:
+                logger.exception("assistant reply failed")
+                await self._guardian_handle_error(
+                    str(exc),
+                    source="assistant",
+                    context={"chat_id": message.chat_id},
+                )
+
+        async def _ask_assistant_with_media(self, message: Message, prompt: str) -> None:
+            if not self._is_image_message(message):
+                kind, payload = _parse_route(prompt)
+                if kind == "img":
+                    await self._cmd_image(message, payload)
+                    return
+                if kind == "ssh":
+                    await self._cmd_ssh(message, payload)
+                    return
+                await self._ask_assistant(message, prompt)
+                return
+            caption = (message.raw_text or "").strip()
+            user_prompt = caption or prompt or "Владелец прислал изображение."
+            try:
+                image_bytes, mime = await self._download_image(message)
+                if len(image_bytes) > 4 * 1024 * 1024:
+                    user_prompt = (
+                        f"{user_prompt}\n\n"
+                        "[Изображение слишком большое для анализа. Попроси уменьшить или описать словами.]"
+                    )
+                else:
+                    openai_key = (self.config["openai_api_key"] or "").strip()
+                    if openai_key and _cursor_ai:
+                        vision_text = await _cursor_ai.analyze_image_openai(
+                            image_bytes,
+                            user_prompt,
+                            api_key=openai_key,
+                            mime=mime,
+                        )
+                        user_prompt = f"{user_prompt}\n\n[Содержимое изображения]\n{vision_text}"
+                    else:
+                        user_prompt = (
+                            f"{user_prompt}\n\n"
+                            "[Владелец прислал изображение. Для полного анализа нужен openai_api_key.]"
+                        )
+                await self._ask_assistant(message, user_prompt)
+            except Exception:
+                logger.exception("assistant image failed")
+
         async def _build_context(self, message: Message) -> str:
             try:
                 meta = await self._describe_chat(message)
@@ -960,6 +1352,16 @@ if loader:
             if action == "pause_afk":
                 self._afk_blocked = True
                 return True
+            if action == "disable_assistant":
+                self._assistant_enabled = False
+                self._assistant_blocked = True
+                self._save_assistant()
+                self._stop_reminder_loop()
+                await self._close_agent(self.tg_id)
+                return True
+            if action == "pause_assistant":
+                self._assistant_blocked = True
+                return True
             if action in ("alert_only", "ignore"):
                 return False
             return False
@@ -977,6 +1379,7 @@ if loader:
                 f"Источник: {source}",
                 f"Ошибка: {error}",
                 f"AFK: enabled={self._afk_enabled}, blocked={self._afk_blocked}",
+                f"Assistant: enabled={self._assistant_enabled}, blocked={self._assistant_blocked}",
                 f"Исходящие: {self._outgoing_summary()}",
             ]
             if context:
@@ -1009,6 +1412,8 @@ if loader:
                 return True
             if source == "afk" and self._afk_blocked:
                 return False
+            if source == "assistant" and self._assistant_blocked:
+                return False
 
             limit = int(self.config["guardian_max_outgoing"])
             total = self._outgoing_count()
@@ -1019,7 +1424,8 @@ if loader:
                 f"Источник текущей отправки: {source}\n"
                 f"Статистика: {self._outgoing_summary()}\n"
                 f"Лимит: {limit} за {int(self.config['guardian_window_sec'])} сек\n"
-                f"AFK enabled={self._afk_enabled}, blocked={self._afk_blocked}"
+                f"AFK enabled={self._afk_enabled}, blocked={self._afk_blocked}\n"
+                f"Assistant enabled={self._assistant_enabled}, blocked={self._assistant_blocked}"
             )
             decision = await self._guardian_cursor_json(_GUARDIAN_ANOMALY_HEADER, ctx)
             proceed = bool((decision or {}).get("proceed"))
@@ -1031,6 +1437,7 @@ if loader:
                 "source": source,
                 "created_at": time.time(),
                 "resume_afk": source == "afk" and self._afk_enabled,
+                "resume_assistant": source == "assistant" and self._assistant_enabled,
             }
             await self._send_guardian_alert(
                 "подозрительная активность",
@@ -1042,6 +1449,8 @@ if loader:
             if not proceed:
                 if source == "afk":
                     self._afk_blocked = True
+                if source == "assistant":
+                    self._assistant_blocked = True
                 return False
             return True
 
@@ -1076,8 +1485,11 @@ if loader:
             text = (message.raw_text or "").strip()
             reply_id = message.reply_to.reply_to_msg_id
             if _YES_RE.match(text):
-                if pending.get("kind") == "outgoing_burst" and pending.get("resume_afk"):
-                    self._afk_blocked = False
+                if pending.get("kind") == "outgoing_burst":
+                    if pending.get("resume_afk"):
+                        self._afk_blocked = False
+                    if pending.get("resume_assistant"):
+                        self._assistant_blocked = False
                 self._guardian_pending.pop(reply_id, None)
                 await message.reply("✅ Разрешено. Продолжаю.")
                 return
@@ -1087,9 +1499,16 @@ if loader:
                         self._afk_enabled = False
                         self._afk_enabled_at = 0.0
                         self._save_afk()
-                    self._afk_blocked = True
+                        self._afk_blocked = True
+                    if pending.get("resume_assistant"):
+                        self._assistant_enabled = False
+                        self._save_assistant()
+                        self._stop_reminder_loop()
+                        await self._close_agent(self.tg_id)
+                        self._assistant_blocked = True
                 self._guardian_pending.pop(reply_id, None)
                 await message.reply("🛑 Отменено.")
+                return
 
         @staticmethod
         def _is_image_message(message: Message) -> bool:
@@ -1413,7 +1832,7 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.5.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.6.0]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -1439,7 +1858,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.5.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.6.0</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
                     "▫️ Отправь фото с подписью — анализ изображения\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
@@ -1448,7 +1867,8 @@ if loader:
                     "▫️ <code>.cursorchat</code> — диалог (можно слать фото)\n"
                     "▫️ <code>.cursorstop</code> — выход\n"
                     "▫️ <code>.cursorwatch</code> — следить за чатом\n"
-                    "▫️ <code>.afkcursor</code> — AFK: ИИ-менеджер в личке\n\n"
+                    "▫️ <code>.afkcursor</code> — AFK: ИИ-менеджер в личке\n"
+                    "▫️ <code>.nanobot</code> — персональный AI-ассистент 🐱\n\n"
                     "🔑 Cursor: <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a>\n"
                     "📷 Vision: <code>openai_api_key</code> в <code>.cfg CursorAgent</code>\n"
                     "⚙️ <code>.cfg CursorAgent</code> — ключи, SSH, картинки",
@@ -1547,6 +1967,114 @@ if loader:
             self._save_afk()
             await utils.answer(message, self.strings("afk_on"))
 
+        @loader.command(ru_doc="Персональный AI-ассистент аккаунта — .nanobot")
+        async def nanobotcmd(self, message: Message) -> None:
+            """Персональный AI-ассистент аккаунта — .nanobot"""
+            if not self._owner_only(message):
+                await utils.answer(message, self.strings("owner_only"))
+                return
+
+            args = (utils.get_args_raw(message) or "").strip()
+            lower = args.lower()
+
+            if lower in ("off", "stop", "выкл", "стоп"):
+                if not self._assistant_enabled:
+                    await utils.answer(message, self.strings("nanobot_off"))
+                    return
+                self._assistant_enabled = False
+                self._save_assistant()
+                self._stop_reminder_loop()
+                await self._close_agent(self.tg_id)
+                await utils.answer(message, self.strings("nanobot_off"))
+                return
+
+            if lower in ("memory", "память", "mem"):
+                mem = (self._assistant_memory or "").strip()
+                if not mem:
+                    await utils.answer(message, self.strings("nanobot_memory_empty"))
+                    return
+                await utils.answer(
+                    message,
+                    f"🧠 <b>Память Нанобота</b>\n\n<blockquote expandable>{_escape(mem)}</blockquote>",
+                )
+                return
+
+            if lower in ("forget", "clear", "забудь", "очисти"):
+                self._assistant_memory = ""
+                self._save_assistant()
+                await utils.answer(message, self.strings("nanobot_memory_cleared"))
+                return
+
+            if lower.startswith("remind") or lower.startswith("напомни"):
+                remind_args = args.split(maxsplit=1)
+                if len(remind_args) < 2:
+                    await utils.answer(message, self.strings("nanobot_remind_bad"))
+                    return
+                ts, text = self._parse_remind_time(remind_args[1])
+                if ts is None or not text:
+                    await utils.answer(message, self.strings("nanobot_remind_bad"))
+                    return
+                self._assistant_reminders.append(
+                    {"at": ts, "text": text, "chat_id": message.chat_id}
+                )
+                self._save_reminders()
+                await utils.answer(
+                    message,
+                    self.strings("nanobot_remind_ok").format(
+                        when=_escape(self._format_remind_when(ts)),
+                        quote=_quote(text),
+                    ),
+                )
+                return
+
+            if not args:
+                if not self._api_key():
+                    await utils.answer(message, self.strings("no_key"))
+                    return
+                try:
+                    self._import_cursor_sdk()
+                except ImportError:
+                    await utils.answer(message, self.strings("no_sdk"))
+                    return
+                if self._assistant_enabled:
+                    status = "🟢 включён"
+                    await utils.answer(
+                        message,
+                        f"🐱 <b>Нанобот</b> — {status}\n\n"
+                        "<code>.nanobot off</code> — выключить\n"
+                        "<code>.nanobot memory</code> — память\n"
+                        "<code>.nanobot forget</code> — очистить память\n"
+                        "<code>.nanobot remind 2h текст</code> — напоминание\n\n"
+                        "Пиши в <b>Избранном</b>.",
+                    )
+                    return
+                self._assistant_enabled = True
+                self._assistant_blocked = False
+                self._save_assistant()
+                self._start_reminder_loop()
+                await self._close_agent(self.tg_id)
+                await utils.answer(message, self.strings("nanobot_on"))
+                return
+
+            if not self._api_key():
+                await utils.answer(message, self.strings("no_key"))
+                return
+            try:
+                self._import_cursor_sdk()
+            except ImportError:
+                await utils.answer(message, self.strings("no_sdk"))
+                return
+
+            if not self._assistant_enabled:
+                self._assistant_enabled = True
+                self._assistant_blocked = False
+                self._save_assistant()
+                self._start_reminder_loop()
+                await self._close_agent(self.tg_id)
+                await utils.answer(message, self.strings("nanobot_on"))
+
+            await self._ask_assistant_with_media(message, args)
+
         @loader.watcher(
             incoming=True,
             func=lambda m: not getattr(m, "out", False),
@@ -1568,6 +2096,23 @@ if loader:
                 await self._ask_afk_with_media(message, raw)
                 return
             await self._ask_afk(message, raw)
+
+        @loader.watcher(
+            incoming=True,
+            func=lambda m: m.is_private and not getattr(m, "out", False),
+        )
+        async def cursor_assistant_watcher(self, message: Message) -> None:
+            if not self._should_assistant_reply(message):
+                return
+            if not self._assistant_cooldown_ok(message.chat_id):
+                return
+            raw = (message.raw_text or "").strip()
+            if raw.lower().startswith(".nanobot"):
+                return
+            if self._is_image_message(message):
+                await self._ask_assistant_with_media(message, raw)
+                return
+            await self._ask_assistant(message, raw)
 
         @loader.watcher(
             incoming=True,
