@@ -1,4 +1,4 @@
-# @version=1.5.0
+# @version=1.5.1
 # @description Cursor AI агент из Telegram (cloud, изображения, AFK)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -22,6 +22,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import random
 import re
 import time
 import urllib.parse
@@ -76,18 +77,34 @@ _AFK_HEADER = """Ты — ИИ-менеджер пользователя {owner_
 Изучи историю переписки ниже — пойми, кто собеседник, какой у вас стиль общения, о чём вы обычно говорите.
 
 Правила ответа:
-1. Кратко представься: ты ИИ-менеджер {owner_name}, пользователь сейчас не может ответить, поэтому отвечаешь ты.
-2. Если на сообщение можно ответить по существу (приветствие, small talk, вопрос из контекста переписки) — ответь.
+1. Следуй дополнительным инструкциям ниже про представление и приветствия.
+2. Если на сообщение можно ответить по существу (вопрос, small talk, контекст переписки) — ответь.
 3. Если нужна личная информация только от пользователя или решение за него — вежливо скажи, что передашь, когда он вернётся.
 4. Пиши по-русски, естественно, 1–4 предложения. Без markdown, без списков. Максимум 1 emoji.
 5. Не выдумывай факты о пользователе — опирайся только на историю чата.
 6. Подстраивай тон под собеседника и вашу переписку.
+7. Меняй формулировки — не повторяй одни и те же фразы в разных ответах.
+
+{extra_rules}
 
 {context}
 
 ---
 Новое сообщение от собеседника:
 """
+
+_AFK_INTRO_STYLES = (
+    "скажи своими словами, что временно отвечаешь за {owner_name}",
+    "объясни нейтрально, что {owner_name} сейчас недоступен и ты подменяешь",
+    "начни с сути, без формального приветствия",
+    "коротко и по-деловому — кто ты и почему отвечаешь",
+)
+
+_GREETING_RE = re.compile(
+    r"(?:^|[\s,.!?])(?:привет|здравств|здаров|хай|hello|hi|hey|"
+    r"добр(?:ый|ое|ой|ая|ого|ой)|салам|ку|доброго)\b",
+    re.IGNORECASE,
+)
 
 _GUARDIAN_ERROR_HEADER = """Ты — страж модуля CursorAgent (Telegram userbot на Hikka/Heroku).
 Произошла ошибка. Проанализируй и верни ТОЛЬКО валидный JSON без markdown:
@@ -341,6 +358,7 @@ if loader:
             self._afk_enabled: bool = False
             self._afk_enabled_at: float = 0.0
             self._afk_at: dict[int, float] = {}
+            self._afk_introduced: set[int] = set()
             self._afk_blocked: bool = False
             self._outgoing_log: list[tuple[float, str]] = []
             self._guardian_pending: dict[int, dict] = {}
@@ -482,6 +500,9 @@ if loader:
             if self._afk_enabled and self._afk_enabled_at <= 0:
                 self._afk_enabled_at = time.time()
                 self._save_afk()
+            saved_intro = self._db.get(self.strings("name"), "afk_introduced_chats", [])
+            if isinstance(saved_intro, list):
+                self._afk_introduced = {int(x) for x in saved_intro}
 
         def _save_watched(self) -> None:
             self._db.set(self.strings("name"), "watched_chats", list(self._watched_chats))
@@ -489,6 +510,11 @@ if loader:
         def _save_afk(self) -> None:
             self._db.set(self.strings("name"), "afk_enabled", self._afk_enabled)
             self._db.set(self.strings("name"), "afk_enabled_at", self._afk_enabled_at)
+            self._db.set(
+                self.strings("name"),
+                "afk_introduced_chats",
+                list(self._afk_introduced),
+            )
 
         @staticmethod
         def _import_cursor_sdk():
@@ -637,8 +663,57 @@ if loader:
                 parts.extend(history)
             return "\n".join(parts)
 
-        def _wrap_afk_prompt(self, prompt: str, context: str, owner_name: str) -> str:
-            return _AFK_HEADER.format(owner_name=owner_name, context=context) + prompt
+        @staticmethod
+        def _afk_is_greeting(text: str) -> bool:
+            return bool(_GREETING_RE.search((text or "").strip()))
+
+        def _afk_extra_rules(self, chat_id: int, user_message: str, owner_name: str) -> str:
+            lines: list[str] = []
+            first = chat_id not in self._afk_introduced
+
+            if first:
+                style = random.choice(_AFK_INTRO_STYLES).format(owner_name=owner_name)
+                lines.append(
+                    "Это твой первый ответ в этом чате в AFK-режиме. "
+                    f"Кратко представься ({style}). "
+                    "Не начинай с «Привет» — сразу к делу."
+                )
+            else:
+                lines.append(
+                    "Ты уже представлялся в этом чате. Не повторяй вступление "
+                    "и не представляйся снова."
+                )
+                if self._afk_is_greeting(user_message):
+                    lines.append(
+                        "Собеседник поздоровался — ответь по существу, "
+                        "но не начинай ответ с приветствия."
+                    )
+                else:
+                    lines.append(
+                        "Собеседник не здоровается — не начинай ответ с приветствия "
+                        "(ни «привет», ни «здравствуй», ни «добрый день»)."
+                    )
+
+            lines.append(
+                "Избегай шаблонов вроде «Привет, я ИИ-менеджер» — каждый ответ "
+                "формулируй по-новому."
+            )
+            return "\n".join(lines)
+
+        def _wrap_afk_prompt(
+            self,
+            prompt: str,
+            context: str,
+            owner_name: str,
+            chat_id: int,
+        ) -> str:
+            extra = self._afk_extra_rules(chat_id, prompt, owner_name)
+            header = _AFK_HEADER.format(
+                owner_name=owner_name,
+                context=context,
+                extra_rules=extra,
+            )
+            return header + prompt
 
         def _afk_cooldown_ok(self, chat_id: int) -> bool:
             cooldown = int(self.config["afk_cooldown"])
@@ -695,7 +770,9 @@ if loader:
                 me = await self.client.get_me()
                 owner_name = _person_name(me)
                 context = await self._build_afk_context(message)
-                full_prompt = self._wrap_afk_prompt(prompt, context, owner_name)
+                full_prompt = self._wrap_afk_prompt(
+                    prompt, context, owner_name, message.chat_id
+                )
                 bridge = await self._ensure_bridge()
                 result = await cs.AsyncAgent.prompt(
                     full_prompt,
@@ -733,6 +810,8 @@ if loader:
 
                 await self._reply_afk_plain(message, text)
                 self._afk_at[message.chat_id] = time.time()
+                self._afk_introduced.add(message.chat_id)
+                self._save_afk()
             except Exception as exc:
                 logger.exception("afk reply failed")
                 await self._guardian_handle_error(
@@ -954,6 +1033,7 @@ if loader:
             if action == "disable_afk":
                 self._afk_enabled = False
                 self._afk_enabled_at = 0.0
+                self._afk_introduced.clear()
                 self._afk_blocked = True
                 self._save_afk()
                 return True
@@ -1086,6 +1166,7 @@ if loader:
                     if pending.get("resume_afk"):
                         self._afk_enabled = False
                         self._afk_enabled_at = 0.0
+                        self._afk_introduced.clear()
                         self._save_afk()
                     self._afk_blocked = True
                 self._guardian_pending.pop(reply_id, None)
@@ -1524,6 +1605,7 @@ if loader:
                     return
                 self._afk_enabled = False
                 self._afk_enabled_at = 0.0
+                self._afk_introduced.clear()
                 self._save_afk()
                 await utils.answer(message, self.strings("afk_off"))
                 return
@@ -1544,6 +1626,7 @@ if loader:
 
             self._afk_enabled = True
             self._afk_enabled_at = time.time()
+            self._afk_introduced.clear()
             self._save_afk()
             await utils.answer(message, self.strings("afk_on"))
 
