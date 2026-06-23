@@ -1,4 +1,4 @@
-# @version=1.4.1
+# @version=1.5.0
 # @description Cursor AI агент из Telegram (cloud, изображения, AFK)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import re
 import time
@@ -87,6 +88,36 @@ _AFK_HEADER = """Ты — ИИ-менеджер пользователя {owner_
 ---
 Новое сообщение от собеседника:
 """
+
+_GUARDIAN_ERROR_HEADER = """Ты — страж модуля CursorAgent (Telegram userbot на Hikka/Heroku).
+Произошла ошибка. Проанализируй и верни ТОЛЬКО валидный JSON без markdown:
+{{"action":"retry"|"reset_bridge"|"disable_afk"|"pause_afk"|"alert_only"|"ignore","reason":"кратко","owner_message":"сообщение владельцу на русском"}}
+
+Доступные action:
+- retry — безопасно повторить запрос (1 раз)
+- reset_bridge — сбросить мост Cursor SDK
+- disable_afk — выключить AFK-режим
+- pause_afk — временно остановить AFK-ответы
+- alert_only — только уведомить владельца, не чинить самому
+- ignore — ничего не делать
+
+Контекст ошибки:
+{context}
+"""
+
+_GUARDIAN_ANOMALY_HEADER = """Ты — страж модуля CursorAgent (Telegram userbot).
+Обнаружена подозрительная активность. Верни ТОЛЬКО валидный JSON без markdown:
+{{"proceed":true|false,"reason":"кратко","owner_message":"описание странности для владельца на русском"}}
+
+proceed=false если активность похожа на спам, утечку токенов, зацикливание или атаку.
+proceed=true только если это нормальная нагрузка.
+
+Детали:
+{context}
+"""
+
+_YES_RE = re.compile(r"^(?:да|yes|y|\+|ok|ок|выполн|продолж|разреши)\b", re.IGNORECASE)
+_NO_RE = re.compile(r"^(?:нет|no|n|\-|стоп|stop|отмен|запрет|не\s*выполн)\b", re.IGNORECASE)
 
 _HELP_TRIGGERS = re.compile(
     r"(?:\?|помоги|помощь|не работает|ошибк|баг|как сделать|как настроить|"
@@ -310,6 +341,10 @@ if loader:
             self._afk_enabled: bool = False
             self._afk_enabled_at: float = 0.0
             self._afk_at: dict[int, float] = {}
+            self._afk_blocked: bool = False
+            self._outgoing_log: list[tuple[float, str]] = []
+            self._guardian_pending: dict[int, dict] = {}
+            self._guardian_last_alert: float = 0.0
             self.config = loader.ModuleConfig(
                 loader.ConfigValue(
                     "cursor_api_key",
@@ -404,6 +439,36 @@ if loader:
                     "",
                     lambda: "Путь к приватному SSH-ключу на сервере userbot",
                 ),
+                loader.ConfigValue(
+                    "guardian_enabled",
+                    True,
+                    lambda: "Страж: автофикс ошибок и алерты о подозрительной активности",
+                    validator=loader.validators.Boolean(),
+                ),
+                loader.ConfigValue(
+                    "guardian_chat_id",
+                    -5475928034,
+                    lambda: "ID группы для алертов стража",
+                    validator=loader.validators.Integer(),
+                ),
+                loader.ConfigValue(
+                    "guardian_owner_id",
+                    432157779,
+                    lambda: "ID владельца (кто подтверждает да/нет)",
+                    validator=loader.validators.Integer(),
+                ),
+                loader.ConfigValue(
+                    "guardian_max_outgoing",
+                    8,
+                    lambda: "Макс. исходящих сообщений модуля за окно",
+                    validator=loader.validators.Integer(minimum=3, maximum=50),
+                ),
+                loader.ConfigValue(
+                    "guardian_window_sec",
+                    60,
+                    lambda: "Окно подсчёта исходящих (сек)",
+                    validator=loader.validators.Integer(minimum=10, maximum=600),
+                ),
             )
 
         async def client_ready(self, client, db) -> None:  # noqa: ARG002
@@ -493,6 +558,9 @@ if loader:
             query: str | None = None,
             proactive: bool = False,
         ) -> None:
+            source = "proactive" if proactive else "cursor"
+            if not await self._guardian_check_outgoing(source):
+                return
             body = _format_cursor_reply(
                 text,
                 model=self._model(),
@@ -501,6 +569,7 @@ if loader:
             )
             for chunk in _chunks(body):
                 await utils.answer(message, chunk)
+            await self._guardian_after_outgoing(source)
 
         async def _describe_chat(self, message: Message) -> list[str]:
             lines: list[str] = []
@@ -592,6 +661,8 @@ if loader:
                     return False
                 if message.date.timestamp() < self._afk_enabled_at:
                     return False
+            if self._afk_blocked:
+                return False
             text = (message.raw_text or "").strip()
             if text.startswith(".") or text.startswith("/"):
                 return False
@@ -600,11 +671,14 @@ if loader:
             return True
 
         async def _reply_afk_plain(self, message: Message, text: str) -> None:
+            if not await self._guardian_check_outgoing("afk"):
+                return
             body = (text or "").strip()
             if not body:
                 return
             for chunk in _chunks(body, size=4000):
                 await message.reply(chunk)
+            await self._guardian_after_outgoing("afk")
 
         async def _ask_afk(self, message: Message, prompt: str) -> None:
             try:
@@ -630,8 +704,28 @@ if loader:
                 )
 
                 if result.status == "error":
-                    logger.warning("afk: cursor run failed")
-                    return
+                    detail = (result.result or "").strip() or "run failed"
+                    fix = await self._guardian_handle_error(
+                        detail,
+                        source="afk",
+                        context={"chat_id": message.chat_id, "prompt": prompt[:200]},
+                    )
+                    if fix == "reset_bridge":
+                        bridge = await self._ensure_bridge()
+                        result = await cs.AsyncAgent.prompt(
+                            full_prompt,
+                            self._cloud_options(),
+                            client=bridge,
+                        )
+                    elif fix == "retry":
+                        result = await cs.AsyncAgent.prompt(
+                            full_prompt,
+                            self._cloud_options(),
+                            client=bridge,
+                        )
+                    if result.status == "error":
+                        logger.warning("afk: cursor run failed")
+                        return
 
                 text = (result.result or "").strip()
                 if not text:
@@ -639,8 +733,13 @@ if loader:
 
                 await self._reply_afk_plain(message, text)
                 self._afk_at[message.chat_id] = time.time()
-            except Exception:
+            except Exception as exc:
                 logger.exception("afk reply failed")
+                await self._guardian_handle_error(
+                    str(exc),
+                    source="afk",
+                    context={"chat_id": message.chat_id},
+                )
 
         async def _ask_afk_with_media(self, message: Message, prompt: str) -> None:
             if not self._is_image_message(message):
@@ -716,6 +815,281 @@ if loader:
 
         def _owner_only(self, message: Message) -> bool:
             return message.sender_id == self.tg_id
+
+        def _guardian_on(self) -> bool:
+            return bool(self.config["guardian_enabled"])
+
+        def _guardian_owner_id(self) -> int:
+            return int(self.config["guardian_owner_id"] or 432157779)
+
+        def _guardian_chat_id(self) -> int:
+            return int(self.config["guardian_chat_id"] or -5475928034)
+
+        def _record_outgoing(self, source: str) -> None:
+            now = time.time()
+            self._outgoing_log.append((now, source))
+            window = int(self.config["guardian_window_sec"])
+            cutoff = now - window
+            self._outgoing_log = [(t, s) for t, s in self._outgoing_log if t >= cutoff]
+
+        def _outgoing_count(self, *, source: str | None = None) -> int:
+            window = int(self.config["guardian_window_sec"])
+            cutoff = time.time() - window
+            if source:
+                return sum(1 for t, s in self._outgoing_log if t >= cutoff and s == source)
+            return sum(1 for t, s in self._outgoing_log if t >= cutoff)
+
+        def _outgoing_summary(self) -> str:
+            window = int(self.config["guardian_window_sec"])
+            cutoff = time.time() - window
+            counts: dict[str, int] = {}
+            for t, s in self._outgoing_log:
+                if t >= cutoff:
+                    counts[s] = counts.get(s, 0) + 1
+            if not counts:
+                return f"0 сообщений за {window} сек"
+            parts = [f"{name}: {n}" for name, n in sorted(counts.items(), key=lambda x: -x[1])]
+            return f"{sum(counts.values())} сообщений за {window} сек ({', '.join(parts)})"
+
+        async def _reset_cursor_bridge(self) -> None:
+            global _cursor_sdk_bridge
+            for uid in list(self._cursor_agents):
+                await self._close_agent(uid)
+            _cursor_sdk_bridge = None
+
+        @staticmethod
+        def _parse_guardian_json(text: str) -> dict | None:
+            raw = (text or "").strip()
+            if not raw:
+                return None
+            if raw.startswith("```"):
+                raw = re.sub(r"^```(?:json)?\s*", "", raw)
+                raw = re.sub(r"\s*```$", "", raw)
+            try:
+                data = json.loads(raw)
+                return data if isinstance(data, dict) else None
+            except json.JSONDecodeError:
+                match = re.search(r"\{.*\}", raw, re.DOTALL)
+                if not match:
+                    return None
+                try:
+                    data = json.loads(match.group(0))
+                    return data if isinstance(data, dict) else None
+                except json.JSONDecodeError:
+                    return None
+
+        async def _guardian_cursor_json(self, header: str, context: str) -> dict | None:
+            if not self._guardian_on() or not self._api_key():
+                return None
+            try:
+                cs = self._import_cursor_sdk()
+            except ImportError:
+                return None
+            prompt = header.format(context=context[:4000])
+            try:
+                bridge = await self._ensure_bridge()
+                result = await cs.AsyncAgent.prompt(
+                    prompt,
+                    self._cloud_options(),
+                    client=bridge,
+                )
+                if result.status == "error":
+                    return None
+                return self._parse_guardian_json(result.result or "")
+            except Exception:
+                logger.exception("guardian cursor analyze failed")
+                return None
+
+        async def _send_guardian_alert(
+            self,
+            title: str,
+            body: str,
+            *,
+            pending: dict | None = None,
+        ) -> int | None:
+            if not self._guardian_on():
+                return None
+            now = time.time()
+            if now - self._guardian_last_alert < 15:
+                return None
+            self._guardian_last_alert = now
+
+            owner_id = self._guardian_owner_id()
+            lines = [
+                f"⚠️ <b>CursorAgent — { _escape(title)}</b>",
+                "",
+                body,
+                "",
+                f"👤 Владелец: <a href=\"tg://user?id={owner_id}\">id{owner_id}</a>",
+            ]
+            if pending:
+                lines.append("")
+                lines.append("❓ <b>Выполнить дальше?</b> Ответь <b>reply</b>: <code>да</code> / <code>нет</code>")
+            text = "\n".join(lines)
+
+            chat_id = self._guardian_chat_id()
+            chat_ids = [chat_id]
+            if chat_id < 0:
+                bare = abs(chat_id)
+                if bare < 10**10:
+                    chat_ids.append(int(f"-100{bare}"))
+            for cid in chat_ids:
+                try:
+                    msg = await self.client.send_message(cid, text, parse_mode="html")
+                    if pending and msg:
+                        self._guardian_pending[msg.id] = pending
+                    return msg.id if msg else None
+                except Exception:
+                    logger.exception("guardian alert failed for %s", cid)
+                    continue
+            return None
+
+        async def _apply_guardian_action(self, action: str, *, source: str = "") -> bool:
+            action = (action or "").strip().lower()
+            if action == "retry":
+                return True
+            if action == "reset_bridge":
+                await self._reset_cursor_bridge()
+                return True
+            if action == "disable_afk":
+                self._afk_enabled = False
+                self._afk_enabled_at = 0.0
+                self._afk_blocked = True
+                self._save_afk()
+                return True
+            if action == "pause_afk":
+                self._afk_blocked = True
+                return True
+            if action in ("alert_only", "ignore"):
+                return False
+            return False
+
+        async def _guardian_handle_error(
+            self,
+            error: str,
+            *,
+            source: str,
+            context: dict | None = None,
+        ) -> str | None:
+            if not self._guardian_on():
+                return None
+            ctx_lines = [
+                f"Источник: {source}",
+                f"Ошибка: {error}",
+                f"AFK: enabled={self._afk_enabled}, blocked={self._afk_blocked}",
+                f"Исходящие: {self._outgoing_summary()}",
+            ]
+            if context:
+                for k, v in context.items():
+                    ctx_lines.append(f"{k}: {v}")
+            decision = await self._guardian_cursor_json(
+                _GUARDIAN_ERROR_HEADER,
+                "\n".join(ctx_lines),
+            )
+            action = (decision or {}).get("action", "alert_only")
+            reason = (decision or {}).get("reason") or error
+            owner_msg = (decision or {}).get("owner_message") or reason
+
+            await self._apply_guardian_action(str(action), source=source)
+
+            if action in ("retry", "reset_bridge"):
+                return str(action)
+
+            await self._send_guardian_alert(
+                "ошибка",
+                f"🤖 <b>Cursor:</b> {_escape(str(owner_msg))}\n"
+                f"🔧 <b>Действие:</b> <code>{_escape(str(action))}</code>\n"
+                f"📋 {_escape(str(reason))}",
+            )
+            return None
+
+        async def _guardian_check_outgoing(self, source: str) -> bool:
+            """True = можно отправлять, False = заблокировано."""
+            if not self._guardian_on():
+                return True
+            if source == "afk" and self._afk_blocked:
+                return False
+
+            limit = int(self.config["guardian_max_outgoing"])
+            total = self._outgoing_count()
+            if total < limit:
+                return True
+
+            ctx = (
+                f"Источник текущей отправки: {source}\n"
+                f"Статистика: {self._outgoing_summary()}\n"
+                f"Лимит: {limit} за {int(self.config['guardian_window_sec'])} сек\n"
+                f"AFK enabled={self._afk_enabled}, blocked={self._afk_blocked}"
+            )
+            decision = await self._guardian_cursor_json(_GUARDIAN_ANOMALY_HEADER, ctx)
+            proceed = bool((decision or {}).get("proceed"))
+            reason = (decision or {}).get("reason") or "Слишком много исходящих сообщений"
+            owner_msg = (decision or {}).get("owner_message") or reason
+
+            pending = {
+                "kind": "outgoing_burst",
+                "source": source,
+                "created_at": time.time(),
+                "resume_afk": source == "afk" and self._afk_enabled,
+            }
+            await self._send_guardian_alert(
+                "подозрительная активность",
+                f"📊 {_escape(self._outgoing_summary())}\n\n"
+                f"🤖 <b>Cursor:</b> {_escape(str(owner_msg))}\n"
+                f"📋 {_escape(str(reason))}",
+                pending=pending if not proceed else None,
+            )
+            if not proceed:
+                if source == "afk":
+                    self._afk_blocked = True
+                return False
+            return True
+
+        async def _guardian_after_outgoing(self, source: str) -> None:
+            self._record_outgoing(source)
+            limit = int(self.config["guardian_max_outgoing"])
+            if self._outgoing_count() >= limit:
+                await self._guardian_check_outgoing(source)
+
+        def _resolve_guardian_pending(self, reply_msg: Message) -> dict | None:
+            reply = getattr(reply_msg, "reply_to", None)
+            if not reply:
+                return None
+            return self._guardian_pending.get(getattr(reply, "reply_to_msg_id", None))
+
+        async def _handle_guardian_reply(self, message: Message) -> None:
+            if not self._guardian_on():
+                return
+            owner_id = self._guardian_owner_id()
+            if message.sender_id != owner_id:
+                return
+            chat_ids = {self._guardian_chat_id()}
+            bare = abs(self._guardian_chat_id())
+            if bare < 10**10:
+                chat_ids.add(int(f"-100{bare}"))
+            if message.chat_id not in chat_ids:
+                return
+            pending = self._resolve_guardian_pending(message)
+            if not pending:
+                return
+
+            text = (message.raw_text or "").strip()
+            reply_id = message.reply_to.reply_to_msg_id
+            if _YES_RE.match(text):
+                if pending.get("kind") == "outgoing_burst" and pending.get("resume_afk"):
+                    self._afk_blocked = False
+                self._guardian_pending.pop(reply_id, None)
+                await message.reply("✅ Разрешено. Продолжаю.")
+                return
+            if _NO_RE.match(text):
+                if pending.get("kind") == "outgoing_burst":
+                    if pending.get("resume_afk"):
+                        self._afk_enabled = False
+                        self._afk_enabled_at = 0.0
+                        self._save_afk()
+                    self._afk_blocked = True
+                self._guardian_pending.pop(reply_id, None)
+                await message.reply("🛑 Отменено.")
 
         @staticmethod
         def _is_image_message(message: Message) -> bool:
@@ -949,6 +1323,7 @@ if loader:
             chat: bool = False,
             proactive: bool = False,
             with_context: bool = True,
+            _guardian_retry: bool = False,
         ) -> str | None:
             try:
                 cs = self._import_cursor_sdk()
@@ -963,6 +1338,7 @@ if loader:
             if not proactive:
                 await utils.answer(message, self.strings("thinking"))
 
+            source = "proactive" if proactive else ("cursor_chat" if chat else "cursor")
             try:
                 context = await self._build_context(message) if with_context else ""
                 full_prompt = (
@@ -984,9 +1360,24 @@ if loader:
                     )
 
                 if result.status == "error":
+                    detail = (result.result or "").strip()
+                    msg = detail or "run failed (проверь cursor_api_key и лимит подписки Cursor)"
+                    if not _guardian_retry and self._guardian_on():
+                        fix = await self._guardian_handle_error(
+                            msg,
+                            source=source,
+                            context={"chat_id": message.chat_id, "chat": chat},
+                        )
+                        if fix in ("retry", "reset_bridge"):
+                            return await self._ask(
+                                message,
+                                prompt,
+                                chat=chat,
+                                proactive=proactive,
+                                with_context=with_context,
+                                _guardian_retry=True,
+                            )
                     if not proactive:
-                        detail = (result.result or "").strip()
-                        msg = detail or "run failed (проверь cursor_api_key и лимит подписки Cursor)"
                         await utils.answer(message, self.strings("error").format(_escape(msg)))
                     return None
 
@@ -1002,12 +1393,27 @@ if loader:
                 return text
             except Exception as exc:
                 name = type(exc).__name__
+                if not _guardian_retry and self._guardian_on():
+                    fix = await self._guardian_handle_error(
+                        str(exc),
+                        source=source,
+                        context={"exc_type": name, "chat_id": message.chat_id},
+                    )
+                    if fix in ("retry", "reset_bridge"):
+                        return await self._ask(
+                            message,
+                            prompt,
+                            chat=chat,
+                            proactive=proactive,
+                            with_context=with_context,
+                            _guardian_retry=True,
+                        )
                 if not proactive:
                     if name == "CursorAgentError":
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.4.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.5.0]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -1033,7 +1439,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.4.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.5.0</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
                     "▫️ Отправь фото с подписью — анализ изображения\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
@@ -1140,6 +1546,13 @@ if loader:
             self._afk_enabled_at = time.time()
             self._save_afk()
             await utils.answer(message, self.strings("afk_on"))
+
+        @loader.watcher(
+            incoming=True,
+            func=lambda m: not getattr(m, "out", False),
+        )
+        async def cursor_guardian_watcher(self, message: Message) -> None:
+            await self._handle_guardian_reply(message)
 
         @loader.watcher(
             incoming=True,
