@@ -1,4 +1,4 @@
-# @version=1.4.0
+# @version=1.4.1
 # @description Cursor AI агент из Telegram (cloud, изображения, AFK)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -286,8 +286,9 @@ if loader:
             ),
             "afk_on": (
                 "🌙 <b>AFK-режим включён</b>\n\n"
-                "ИИ-менеджер отвечает в личку за вас, пока вы недоступны.\n"
-                "Изучает историю переписки и отвечает от вашего имени.\n\n"
+                "ИИ-менеджер отвечает только в личку и только на сообщения, "
+                "пришедшие после включения AFK.\n"
+                "Старые сообщения и групповые чаты игнорируются.\n\n"
                 "<code>.afkcursor off</code> — выключить"
             ),
             "afk_off": "☀️ AFK-режим выключен. ИИ-менеджер больше не отвечает в личку.",
@@ -305,6 +306,7 @@ if loader:
             self._watched_chats: set[int] = set()
             self._proactive_at: dict[int, float] = {}
             self._afk_enabled: bool = False
+            self._afk_enabled_at: float = 0.0
             self._afk_at: dict[int, float] = {}
             self.config = loader.ModuleConfig(
                 loader.ConfigValue(
@@ -407,12 +409,19 @@ if loader:
             if isinstance(saved, list):
                 self._watched_chats = {int(x) for x in saved}
             self._afk_enabled = bool(self._db.get(self.strings("name"), "afk_enabled", False))
+            self._afk_enabled_at = float(
+                self._db.get(self.strings("name"), "afk_enabled_at", 0.0) or 0.0
+            )
+            if self._afk_enabled and self._afk_enabled_at <= 0:
+                self._afk_enabled_at = time.time()
+                self._save_afk()
 
         def _save_watched(self) -> None:
             self._db.set(self.strings("name"), "watched_chats", list(self._watched_chats))
 
         def _save_afk(self) -> None:
             self._db.set(self.strings("name"), "afk_enabled", self._afk_enabled)
+            self._db.set(self.strings("name"), "afk_enabled_at", self._afk_enabled_at)
 
         @staticmethod
         def _import_cursor_sdk():
@@ -515,11 +524,19 @@ if loader:
             lines.append(f"✍️ Автор запроса: {_person_name(sender)}")
             return lines
 
-        async def _recent_messages(self, message: Message, *, limit: int | None = None) -> list[str]:
+        async def _recent_messages(
+            self,
+            message: Message,
+            *,
+            limit: int | None = None,
+            min_timestamp: float | None = None,
+        ) -> list[str]:
             if limit is None:
                 limit = int(self.config["context_messages"])
             rows: list[str] = []
             async for msg in self.client.iter_messages(message.chat_id, limit=limit):
+                if min_timestamp and msg.date and msg.date.timestamp() < min_timestamp:
+                    continue
                 text = (msg.raw_text or msg.message or "").strip()
                 if not text:
                     continue
@@ -535,7 +552,10 @@ if loader:
             try:
                 meta = await self._describe_chat(message)
                 limit = int(self.config["afk_history_messages"])
-                history = await self._recent_messages(message, limit=limit)
+                min_ts = self._afk_enabled_at if self._afk_enabled_at > 0 else None
+                history = await self._recent_messages(
+                    message, limit=limit, min_timestamp=min_ts
+                )
             except Exception:
                 logger.exception("afk context failed")
                 return "Контекст чата недоступен."
@@ -559,10 +579,17 @@ if loader:
         def _should_afk_reply(self, message: Message) -> bool:
             if not self._afk_enabled:
                 return False
+            if not message.is_private:
+                return False
             if getattr(message, "out", False):
                 return False
-            if message.sender_id == self.tg_id:
+            if message.sender_id == self.tg_id or message.chat_id == self.tg_id:
                 return False
+            if self._afk_enabled_at > 0:
+                if not message.date:
+                    return False
+                if message.date.timestamp() < self._afk_enabled_at:
+                    return False
             text = (message.raw_text or "").strip()
             if text.startswith(".") or text.startswith("/"):
                 return False
@@ -1086,6 +1113,7 @@ if loader:
                     await utils.answer(message, self.strings("afk_off"))
                     return
                 self._afk_enabled = False
+                self._afk_enabled_at = 0.0
                 self._save_afk()
                 await utils.answer(message, self.strings("afk_off"))
                 return
@@ -1105,6 +1133,7 @@ if loader:
                 return
 
             self._afk_enabled = True
+            self._afk_enabled_at = time.time()
             self._save_afk()
             await utils.answer(message, self.strings("afk_on"))
 
