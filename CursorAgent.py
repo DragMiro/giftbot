@@ -1533,7 +1533,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.5.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.5.1</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
                     "▫️ Отправь фото с подписью — анализ изображения\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
