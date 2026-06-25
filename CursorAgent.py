@@ -1,4 +1,4 @@
-# @version=1.5.0
+# @version=1.5.1
 # @description Cursor AI агент из Telegram (cloud, изображения, AFK)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -156,6 +157,89 @@ def _chunks(text: str, size: int = 3900) -> list[str]:
 
 def _escape(text: str) -> str:
     return html.escape(text or "", quote=False)
+
+
+def _unwrap_message(message):
+    """Heroku watcher иногда передаёт Event, а не Message."""
+    inner = getattr(message, "message", None)
+    if inner is not None and inner is not message and hasattr(inner, "id"):
+        return inner
+    return message
+
+
+def _msg_chat_id(message) -> int:
+    msg = _unwrap_message(message)
+    if utils:
+        try:
+            return utils.get_chat_id(msg)
+        except Exception:
+            pass
+    cid = getattr(msg, "chat_id", None)
+    if cid:
+        return cid
+    chat = getattr(msg, "chat", None)
+    if chat is not None:
+        return getattr(chat, "id", 0)
+    return getattr(message, "chat_id", 0) or 0
+
+
+def _msg_sender_id(message) -> int:
+    msg = _unwrap_message(message)
+    for obj in (msg, message):
+        sid = getattr(obj, "sender_id", None)
+        if sid:
+            return sid
+    if _msg_is_private(message):
+        cid = _msg_chat_id(message)
+        if cid:
+            return cid
+    for obj in (msg, message):
+        from_id = getattr(obj, "from_id", None)
+        if from_id is not None:
+            uid = getattr(from_id, "user_id", None)
+            if uid:
+                return uid
+        peer = getattr(obj, "peer_id", None)
+        if peer is not None:
+            uid = getattr(peer, "user_id", None)
+            if uid:
+                return uid
+    return 0
+
+
+def _msg_is_private(message) -> bool:
+    msg = _unwrap_message(message)
+    for obj in (msg, message):
+        val = getattr(obj, "is_private", None)
+        if val is not None:
+            return bool(val)
+        val = getattr(obj, "private", None)
+        if val is not None:
+            return bool(val)
+    peer = getattr(msg, "peer_id", None) or getattr(message, "peer_id", None)
+    if peer is not None:
+        return bool(getattr(peer, "user_id", None))
+    return False
+
+
+def _watcher_incoming(message) -> bool:
+    msg = _unwrap_message(message)
+    return not getattr(msg, "out", False)
+
+
+def _watcher_private(message) -> bool:
+    msg = _unwrap_message(message)
+    return _msg_is_private(message) and not getattr(msg, "out", False)
+
+
+def _watcher_group(message) -> bool:
+    msg = _unwrap_message(message)
+    return not _msg_is_private(message) and not getattr(msg, "out", False)
+
+
+def _watcher_owner_out(message) -> bool:
+    msg = _unwrap_message(message)
+    return bool(getattr(msg, "out", False))
 
 
 def _format_inline(text: str) -> str:
@@ -336,6 +420,7 @@ if loader:
         def __init__(self) -> None:
             self._cursor_agents: dict = {}
             self._chat_users: set[int] = set()
+            self._chat_locks: dict[int, asyncio.Lock] = {}
             self._watched_chats: set[int] = set()
             self._proactive_at: dict[int, float] = {}
             self._afk_enabled: bool = False
@@ -547,6 +632,7 @@ if loader:
         async def _close_agent(self, uid: int) -> None:
             agent = self._cursor_agents.pop(uid, None)
             self._chat_users.discard(uid)
+            self._chat_locks.pop(uid, None)
             if agent is not None:
                 await agent.close()
 
@@ -648,25 +734,28 @@ if loader:
             return time.time() - last >= cooldown
 
         def _should_afk_reply(self, message: Message) -> bool:
+            msg = _unwrap_message(message)
             if not self._afk_enabled:
                 return False
-            if not message.is_private:
+            if not _msg_is_private(message):
                 return False
-            if getattr(message, "out", False):
+            if getattr(msg, "out", False):
                 return False
-            if message.sender_id == self.tg_id or message.chat_id == self.tg_id:
+            sid = _msg_sender_id(message)
+            cid = _msg_chat_id(message)
+            if sid == self.tg_id or cid == self.tg_id:
                 return False
             if self._afk_enabled_at > 0:
-                if not message.date:
+                if not msg.date:
                     return False
-                if message.date.timestamp() < self._afk_enabled_at:
+                if msg.date.timestamp() < self._afk_enabled_at:
                     return False
             if self._afk_blocked:
                 return False
-            text = (message.raw_text or "").strip()
+            text = (msg.raw_text or "").strip()
             if text.startswith(".") or text.startswith("/"):
                 return False
-            if not text and not self._is_image_message(message):
+            if not text and not self._is_image_message(msg):
                 return False
             return True
 
@@ -797,11 +886,12 @@ if loader:
             return header.format(context=context) + prompt
 
         def _should_offer_help(self, message: Message) -> bool:
-            if getattr(message, "out", False):
+            msg = _unwrap_message(message)
+            if getattr(msg, "out", False):
                 return False
-            if message.sender_id == self.tg_id:
+            if _msg_sender_id(message) == self.tg_id:
                 return False
-            text = (message.raw_text or "").strip()
+            text = (msg.raw_text or "").strip()
             if len(text) < 8:
                 return False
             if text.startswith(".") or text.startswith("/"):
@@ -814,7 +904,7 @@ if loader:
             return time.time() - last >= cooldown
 
         def _owner_only(self, message: Message) -> bool:
-            return message.sender_id == self.tg_id
+            return _msg_sender_id(message) == self.tg_id
 
         def _guardian_on(self) -> bool:
             return bool(self.config["guardian_enabled"])
@@ -1060,26 +1150,30 @@ if loader:
         async def _handle_guardian_reply(self, message: Message) -> None:
             if not self._guardian_on():
                 return
+            msg = _unwrap_message(message)
             owner_id = self._guardian_owner_id()
-            if message.sender_id != owner_id:
+            if _msg_sender_id(message) != owner_id:
                 return
             chat_ids = {self._guardian_chat_id()}
             bare = abs(self._guardian_chat_id())
             if bare < 10**10:
                 chat_ids.add(int(f"-100{bare}"))
-            if message.chat_id not in chat_ids:
+            if _msg_chat_id(message) not in chat_ids:
                 return
-            pending = self._resolve_guardian_pending(message)
+            pending = self._resolve_guardian_pending(msg)
             if not pending:
                 return
 
-            text = (message.raw_text or "").strip()
-            reply_id = message.reply_to.reply_to_msg_id
+            text = (msg.raw_text or "").strip()
+            reply_to = getattr(msg, "reply_to", None)
+            if not reply_to:
+                return
+            reply_id = reply_to.reply_to_msg_id
             if _YES_RE.match(text):
                 if pending.get("kind") == "outgoing_burst" and pending.get("resume_afk"):
                     self._afk_blocked = False
                 self._guardian_pending.pop(reply_id, None)
-                await message.reply("✅ Разрешено. Продолжаю.")
+                await msg.reply("✅ Разрешено. Продолжаю.")
                 return
             if _NO_RE.match(text):
                 if pending.get("kind") == "outgoing_burst":
@@ -1089,7 +1183,7 @@ if loader:
                         self._save_afk()
                     self._afk_blocked = True
                 self._guardian_pending.pop(reply_id, None)
-                await message.reply("🛑 Отменено.")
+                await msg.reply("🛑 Отменено.")
 
         @staticmethod
         def _is_image_message(message: Message) -> bool:
@@ -1349,9 +1443,12 @@ if loader:
                 bridge = await self._ensure_bridge()
 
                 if chat:
-                    agent = await self._get_agent(message.sender_id)
-                    run = await agent.send(full_prompt)
-                    result = await run.wait()
+                    uid = _msg_sender_id(message)
+                    lock = self._chat_locks.setdefault(uid, asyncio.Lock())
+                    async with lock:
+                        agent = await self._get_agent(uid)
+                        run = await agent.send(full_prompt)
+                        result = await run.wait()
                 else:
                     result = await cs.AsyncAgent.prompt(
                         full_prompt,
@@ -1386,7 +1483,7 @@ if loader:
                     if not text or text.upper() == "SKIP":
                         return None
                     await self._reply_text(message, text, query=prompt, proactive=True)
-                    self._proactive_at[message.chat_id] = time.time()
+                    self._proactive_at[_msg_chat_id(message)] = time.time()
                     return text
 
                 await self._reply_text(message, text or "(пустой ответ)", query=prompt)
@@ -1413,7 +1510,7 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.5.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.5.1]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -1439,7 +1536,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.5.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.5.1</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
                     "▫️ Отправь фото с подписью — анализ изображения\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
@@ -1462,7 +1559,7 @@ if loader:
             if not self._api_key():
                 await utils.answer(message, self.strings("no_key"))
                 return
-            uid = message.sender_id
+            uid = _msg_sender_id(message)
             await self._close_agent(uid)
             await self._get_agent(uid)
             self._chat_users.add(uid)
@@ -1471,8 +1568,21 @@ if loader:
         @loader.command(ru_doc="Завершить диалог — .cursorstop")
         async def cursorstopcmd(self, message: Message) -> None:
             """Завершить диалог — .cursorstop"""
-            await self._close_agent(message.sender_id)
+            await self._close_agent(_msg_sender_id(message))
             await utils.answer(message, self.strings("chat_off"))
+
+        async def _handle_chat_message(self, message: Message) -> None:
+            msg = _unwrap_message(message)
+            uid = _msg_sender_id(message)
+            if uid not in self._chat_users:
+                return
+            raw = (msg.raw_text or "").strip()
+            if self._is_image_message(msg):
+                await self._ask_with_media(msg, raw, chat=True)
+                return
+            if not raw or raw.startswith("."):
+                return
+            await self._dispatch(msg, raw, chat=True)
 
         @loader.command(ru_doc="Следить за чатом — .cursorwatch")
         async def cursorwatchcmd(self, message: Message) -> None:
@@ -1484,14 +1594,14 @@ if loader:
                     "Выполни команду прямо в нужном чате.",
                 )
                 return
-            self._watched_chats.add(message.chat_id)
+            self._watched_chats.add(_msg_chat_id(message))
             self._save_watched()
             await utils.answer(message, self.strings("watch_on"))
 
         @loader.command(ru_doc="Не следить — .cursorunwatch")
         async def cursorunwatchcmd(self, message: Message) -> None:
             """Не следить — .cursorunwatch"""
-            self._watched_chats.discard(message.chat_id)
+            self._watched_chats.discard(_msg_chat_id(message))
             self._save_watched()
             await utils.answer(message, self.strings("watch_off"))
 
@@ -1549,59 +1659,61 @@ if loader:
 
         @loader.watcher(
             incoming=True,
-            func=lambda m: not getattr(m, "out", False),
+            func=_watcher_incoming,
         )
         async def cursor_guardian_watcher(self, message: Message) -> None:
             await self._handle_guardian_reply(message)
 
         @loader.watcher(
             incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            func=_watcher_private,
         )
         async def cursor_afk_watcher(self, message: Message) -> None:
+            msg = _unwrap_message(message)
             if not self._should_afk_reply(message):
                 return
-            if not self._afk_cooldown_ok(message.chat_id):
+            if not self._afk_cooldown_ok(_msg_chat_id(message)):
                 return
-            raw = (message.raw_text or "").strip()
-            if self._is_image_message(message):
-                await self._ask_afk_with_media(message, raw)
+            raw = (msg.raw_text or "").strip()
+            if self._is_image_message(msg):
+                await self._ask_afk_with_media(msg, raw)
                 return
-            await self._ask_afk(message, raw)
+            await self._ask_afk(msg, raw)
 
         @loader.watcher(
             incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            func=_watcher_private,
         )
         async def cursor_watcher(self, message: Message) -> None:
-            uid = message.sender_id
-            if uid not in self._chat_users:
+            await self._handle_chat_message(message)
+
+        @loader.watcher(
+            outgoing=True,
+            func=_watcher_owner_out,
+        )
+        async def cursor_chat_out_watcher(self, message: Message) -> None:
+            if _msg_sender_id(message) != self.tg_id:
                 return
-            raw = (message.raw_text or "").strip()
-            if self._is_image_message(message):
-                await self._ask_with_media(message, raw, chat=True)
-                return
-            if not raw or raw.startswith("."):
-                return
-            await self._dispatch(message, raw, chat=True)
+            await self._handle_chat_message(message)
 
         @loader.watcher(
             incoming=True,
-            func=lambda m: not m.is_private and not getattr(m, "out", False),
+            func=_watcher_group,
         )
         async def cursor_proactive_watcher(self, message: Message) -> None:
             if not self.config["proactive_enabled"]:
                 return
-            if message.chat_id not in self._watched_chats:
+            if _msg_chat_id(message) not in self._watched_chats:
                 return
             if not self._api_key():
                 return
             if not self._should_offer_help(message):
                 return
-            if not self._cooldown_ok(message.chat_id):
+            if not self._cooldown_ok(_msg_chat_id(message)):
                 return
-            text = (message.raw_text or "").strip()
-            await self._ask(message, text, proactive=True)
+            msg = _unwrap_message(message)
+            text = (msg.raw_text or "").strip()
+            await self._ask(msg, text, proactive=True)
 
 else:
     CursorAgentMod = None  # type: ignore[misc, assignment]
