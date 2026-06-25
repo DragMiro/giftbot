@@ -1165,12 +1165,15 @@ if loader:
                 return
 
             text = (msg.raw_text or "").strip()
-            reply_id = message.reply_to.reply_to_msg_id
+            reply_to = getattr(msg, "reply_to", None)
+            if not reply_to:
+                return
+            reply_id = reply_to.reply_to_msg_id
             if _YES_RE.match(text):
                 if pending.get("kind") == "outgoing_burst" and pending.get("resume_afk"):
                     self._afk_blocked = False
                 self._guardian_pending.pop(reply_id, None)
-                await message.reply("✅ Разрешено. Продолжаю.")
+                await msg.reply("✅ Разрешено. Продолжаю.")
                 return
             if _NO_RE.match(text):
                 if pending.get("kind") == "outgoing_burst":
@@ -1180,7 +1183,7 @@ if loader:
                         self._save_afk()
                     self._afk_blocked = True
                 self._guardian_pending.pop(reply_id, None)
-                await message.reply("🛑 Отменено.")
+                await msg.reply("🛑 Отменено.")
 
         @staticmethod
         def _is_image_message(message: Message) -> bool:
