@@ -1,4 +1,4 @@
-# @version=1.6.0
+# @version=1.6.1
 # @description Cursor AI агент из Telegram (cloud, изображения, AFK)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -15,6 +15,7 @@
   .cursorunwatch    — перестать следить
   .afkcursor              — AFK: ИИ-менеджер отвечает в личку за вас
   .afkcursor <режим>      — AFK с режимом (спит, кушает, туалет, …)
+  .afkcursor свой: <текст> — свой статус (или просто .afkcursor <текст>)
   .afkcursor list         — список режимов
   .afkcursor off          — выключить AFK
 """
@@ -204,6 +205,11 @@ proceed=true только если это нормальная нагрузка.
 Детали:
 {context}
 """
+
+_AFK_CUSTOM_PREFIX = re.compile(
+    r"^(?:свой|custom|кастом)\s*[:\-]?\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 _YES_RE = re.compile(r"^(?:да|yes|y|\+|ok|ок|выполн|продолж|разреши)\b", re.IGNORECASE)
 _NO_RE = re.compile(r"^(?:нет|no|n|\-|стоп|stop|отмен|запрет|не\s*выполн)\b", re.IGNORECASE)
@@ -422,13 +428,16 @@ if loader:
                 "<code>.afkcursor off</code> — выключить"
             ),
             "afk_mode_changed": "✅ Режим AFK сменён на {mode_label}",
-            "afk_unknown_mode": (
-                "❌ Неизвестный режим: <code>{mode}</code>\n\n"
-                "<code>.afkcursor list</code> — список режимов"
+            "afk_custom_empty": (
+                "✏️ Укажи свой статус:\n"
+                "<code>.afkcursor свой: занят на встрече</code>\n"
+                "или <code>.afkcursor на свидании</code>"
             ),
             "afk_modes_list": (
                 "🌙 <b>Режимы AFK</b>\n\n"
                 "{modes}\n\n"
+                "✏️ <b>Свой статус</b> — <code>.afkcursor свой: текст</code> "
+                "или <code>.afkcursor &lt;любой текст&gt;</code>\n\n"
                 "<code>.afkcursor &lt;режим&gt;</code> — включить\n"
                 "<code>.afkcursor off</code> — выключить"
             ),
@@ -444,6 +453,7 @@ if loader:
             self._afk_enabled: bool = False
             self._afk_enabled_at: float = 0.0
             self._afk_mode: str = "default"
+            self._afk_custom_status: str = ""
             self._afk_at: dict[int, float] = {}
             self._afk_blocked: bool = False
             self._outgoing_log: list[tuple[float, str]] = []
@@ -584,7 +594,18 @@ if loader:
                 self._db.get(self.strings("name"), "afk_enabled_at", 0.0) or 0.0
             )
             saved_mode = self._db.get(self.strings("name"), "afk_mode", "default")
-            self._afk_mode = saved_mode if saved_mode in _AFK_MODES else "default"
+            saved_custom = str(
+                self._db.get(self.strings("name"), "afk_custom_status", "") or ""
+            ).strip()
+            if saved_mode == "custom" and saved_custom:
+                self._afk_mode = "custom"
+                self._afk_custom_status = saved_custom
+            elif saved_mode in _AFK_MODES:
+                self._afk_mode = saved_mode
+                self._afk_custom_status = ""
+            else:
+                self._afk_mode = "default"
+                self._afk_custom_status = ""
             if self._afk_enabled and self._afk_enabled_at <= 0:
                 self._afk_enabled_at = time.time()
                 self._save_afk()
@@ -596,6 +617,7 @@ if loader:
             self._db.set(self.strings("name"), "afk_enabled", self._afk_enabled)
             self._db.set(self.strings("name"), "afk_enabled_at", self._afk_enabled_at)
             self._db.set(self.strings("name"), "afk_mode", self._afk_mode)
+            self._db.set(self.strings("name"), "afk_custom_status", self._afk_custom_status)
 
         @staticmethod
         def _afk_mode_info(mode_key: str) -> dict[str, object]:
@@ -614,8 +636,65 @@ if loader:
                     return key
             return None
 
-        def _afk_mode_label(self, mode_key: str | None = None) -> str:
-            info = self._afk_mode_info(mode_key or self._afk_mode)
+        def _parse_afk_args(self, raw_args: str) -> tuple[str, str | None] | None:
+            raw = (raw_args or "").strip()
+            if not raw:
+                return "default", None
+
+            match = _AFK_CUSTOM_PREFIX.match(raw)
+            if match:
+                custom = match.group(1).strip()
+                return ("custom", custom) if custom else None
+
+            mode_key = self._resolve_afk_mode(raw)
+            if mode_key:
+                return mode_key, None
+
+            return "custom", raw
+
+        def _set_afk_mode(self, mode_key: str, custom_status: str = "") -> None:
+            self._afk_mode = mode_key
+            if mode_key == "custom":
+                self._afk_custom_status = custom_status.strip()
+            else:
+                self._afk_custom_status = ""
+
+        def _afk_mode_same(self, mode_key: str, custom_status: str | None) -> bool:
+            if mode_key != self._afk_mode:
+                return False
+            if mode_key == "custom":
+                return (custom_status or "").strip() == self._afk_custom_status
+            return True
+
+        def _afk_status_text(
+            self,
+            mode_key: str | None = None,
+            custom_status: str | None = None,
+        ) -> str:
+            key = mode_key or self._afk_mode
+            if key == "custom":
+                text = (
+                    custom_status
+                    if custom_status is not None
+                    else self._afk_custom_status
+                ).strip()
+                return text or "недоступен"
+            return str(self._afk_mode_info(key)["status"])
+
+        def _afk_mode_label(
+            self,
+            mode_key: str | None = None,
+            custom_status: str | None = None,
+        ) -> str:
+            key = mode_key or self._afk_mode
+            if key == "custom":
+                text = (
+                    custom_status
+                    if custom_status is not None
+                    else self._afk_custom_status
+                ).strip()
+                return f"✏️ {_escape(text)}" if text else "✏️ свой статус"
+            info = self._afk_mode_info(key)
             return f"{info['emoji']} {info['label']}"
 
         def _afk_modes_help(self) -> str:
@@ -777,11 +856,10 @@ if loader:
             return "\n".join(parts)
 
         def _wrap_afk_prompt(self, prompt: str, context: str, owner_name: str) -> str:
-            info = self._afk_mode_info(self._afk_mode)
             return _AFK_HEADER.format(
                 owner_name=owner_name,
                 context=context,
-                afk_status=info["status"],
+                afk_status=self._afk_status_text(),
             ) + prompt
 
         def _afk_cooldown_ok(self, chat_id: int) -> bool:
@@ -1680,13 +1758,11 @@ if loader:
                 await utils.answer(message, self._afk_modes_help())
                 return
 
-            mode_key = self._resolve_afk_mode(raw_args) if raw_args else None
-            if raw_args and mode_key is None:
-                await utils.answer(
-                    message,
-                    self.strings("afk_unknown_mode").format(mode=_escape(raw_args)),
-                )
+            parsed = self._parse_afk_args(raw_args) if raw_args else ("default", None)
+            if parsed is None:
+                await utils.answer(message, self.strings("afk_custom_empty"))
                 return
+            mode_key, custom_status = parsed
 
             if not self._api_key():
                 await utils.answer(message, self.strings("no_key"))
@@ -1699,13 +1775,13 @@ if loader:
                 return
 
             if self._afk_enabled:
-                if mode_key and mode_key != self._afk_mode:
-                    self._afk_mode = mode_key
+                if not self._afk_mode_same(mode_key, custom_status):
+                    self._set_afk_mode(mode_key, custom_status or "")
                     self._save_afk()
                     await utils.answer(
                         message,
                         self.strings("afk_mode_changed").format(
-                            mode_label=self._afk_mode_label(mode_key)
+                            mode_label=self._afk_mode_label(mode_key, custom_status),
                         ),
                     )
                     return
@@ -1715,8 +1791,7 @@ if loader:
                 )
                 return
 
-            if mode_key:
-                self._afk_mode = mode_key
+            self._set_afk_mode(mode_key, custom_status or "")
 
             self._afk_enabled = True
             self._afk_enabled_at = time.time()
