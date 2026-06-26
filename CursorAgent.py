@@ -1,4 +1,4 @@
-# @version=1.5.0
+# @version=1.5.1
 # @description Cursor AI агент из Telegram (cloud, изображения, AFK)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -156,6 +156,18 @@ def _chunks(text: str, size: int = 3900) -> list[str]:
 
 def _escape(text: str) -> str:
     return html.escape(text or "", quote=False)
+
+
+def _as_message(obj) -> Message | None:
+    """Heroku 2.0: watcher может получить Event (ChatAction) без sender_id."""
+    if obj is None:
+        return None
+    inner = getattr(obj, "message", None)
+    if inner is not None and getattr(inner, "id", None) is not None:
+        return inner
+    if hasattr(obj, "sender_id"):
+        return obj
+    return None
 
 
 def _format_inline(text: str) -> str:
@@ -1058,6 +1070,9 @@ if loader:
             return self._guardian_pending.get(getattr(reply, "reply_to_msg_id", None))
 
         async def _handle_guardian_reply(self, message: Message) -> None:
+            message = _as_message(message)
+            if message is None:
+                return
             if not self._guardian_on():
                 return
             owner_id = self._guardian_owner_id()
@@ -1548,17 +1563,22 @@ if loader:
             await utils.answer(message, self.strings("afk_on"))
 
         @loader.watcher(
-            incoming=True,
-            func=lambda m: not getattr(m, "out", False),
+            "in",
+            filter=lambda m: _as_message(m) is not None and not getattr(m, "out", False),
         )
         async def cursor_guardian_watcher(self, message: Message) -> None:
             await self._handle_guardian_reply(message)
 
         @loader.watcher(
-            incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            "in",
+            filter=lambda m: _as_message(m) is not None
+            and m.is_private
+            and not getattr(m, "out", False),
         )
         async def cursor_afk_watcher(self, message: Message) -> None:
+            message = _as_message(message)
+            if message is None:
+                return
             if not self._should_afk_reply(message):
                 return
             if not self._afk_cooldown_ok(message.chat_id):
@@ -1570,10 +1590,15 @@ if loader:
             await self._ask_afk(message, raw)
 
         @loader.watcher(
-            incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            "in",
+            filter=lambda m: _as_message(m) is not None
+            and m.is_private
+            and not getattr(m, "out", False),
         )
         async def cursor_watcher(self, message: Message) -> None:
+            message = _as_message(message)
+            if message is None:
+                return
             uid = message.sender_id
             if uid not in self._chat_users:
                 return
@@ -1586,10 +1611,15 @@ if loader:
             await self._dispatch(message, raw, chat=True)
 
         @loader.watcher(
-            incoming=True,
-            func=lambda m: not m.is_private and not getattr(m, "out", False),
+            "in",
+            filter=lambda m: _as_message(m) is not None
+            and not m.is_private
+            and not getattr(m, "out", False),
         )
         async def cursor_proactive_watcher(self, message: Message) -> None:
+            message = _as_message(message)
+            if message is None:
+                return
             if not self.config["proactive_enabled"]:
                 return
             if message.chat_id not in self._watched_chats:
