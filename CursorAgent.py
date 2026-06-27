@@ -1,4 +1,4 @@
-# @version=1.5.0
+# @version=1.5.1
 # @description Cursor AI агент из Telegram (cloud, изображения, AFK)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -242,6 +242,49 @@ def _person_name(entity) -> str:
     return name or f"id:{getattr(entity, 'id', '?')}"
 
 
+def _unwrap_message(obj):
+    """Message из watcher/command; Heroku 2.0 иногда передаёт Event без sender_id."""
+    if obj is None:
+        return None
+    if hasattr(obj, "chat_id") and (
+        hasattr(obj, "raw_text") or hasattr(obj, "text") or hasattr(obj, "message")
+    ):
+        return obj
+    inner = getattr(obj, "message", None)
+    if inner is not None:
+        return inner
+    return obj
+
+
+def _message_sender_id(message) -> int | None:
+    if message is None:
+        return None
+    sid = getattr(message, "sender_id", None)
+    if sid is not None:
+        return sid
+    from_id = getattr(message, "from_id", None)
+    if from_id is not None:
+        return from_id
+    sender = getattr(message, "sender", None)
+    if sender is not None:
+        return getattr(sender, "id", None)
+    return None
+
+
+def _watcher_incoming_filter(obj) -> bool:
+    message = _unwrap_message(obj)
+    return message is not None and not getattr(message, "out", False)
+
+
+def _watcher_proactive_filter(obj) -> bool:
+    message = _unwrap_message(obj)
+    return (
+        message is not None
+        and not getattr(message, "out", False)
+        and not getattr(message, "is_private", False)
+    )
+
+
 if loader:
 
     class CursorAgentMod(loader.Module):
@@ -255,6 +298,7 @@ if loader:
             "_cmd_doc_cursorstop": "Завершить диалог — .cursorstop",
             "_cmd_doc_cursorwatch": "Следить за чатом — .cursorwatch",
             "_cmd_doc_cursorunwatch": "Не следить — .cursorunwatch",
+            "_cmd_doc_cursorwatchlist": "Список чатов под наблюдением — .cursorwatchlist",
             "_cmd_doc_cursorimg": "Картинка по описанию — .cursorimg",
             "_cmd_doc_cursorssh": "Команда по SSH — .cursorssh",
             "_cmd_doc_afkcursor": "AFK: ИИ-менеджер отвечает в личку — .afkcursor",
@@ -471,7 +515,8 @@ if loader:
                 ),
             )
 
-        async def client_ready(self, client, db) -> None:  # noqa: ARG002
+        async def client_ready(self, client, db) -> None:
+            self._db = db
             saved = self._db.get(self.strings("name"), "watched_chats", [])
             if isinstance(saved, list):
                 self._watched_chats = {int(x) for x in saved}
@@ -557,8 +602,9 @@ if loader:
             *,
             query: str | None = None,
             proactive: bool = False,
+            chat: bool = False,
         ) -> None:
-            source = "proactive" if proactive else "cursor"
+            source = "proactive" if proactive else ("cursor_chat" if chat else "cursor")
             if not await self._guardian_check_outgoing(source):
                 return
             body = _format_cursor_reply(
@@ -648,13 +694,17 @@ if loader:
             return time.time() - last >= cooldown
 
         def _should_afk_reply(self, message: Message) -> bool:
+            message = _unwrap_message(message)
+            if message is None:
+                return False
             if not self._afk_enabled:
                 return False
             if not message.is_private:
                 return False
             if getattr(message, "out", False):
                 return False
-            if message.sender_id == self.tg_id or message.chat_id == self.tg_id:
+            sender_id = _message_sender_id(message)
+            if sender_id == self.tg_id or message.chat_id == self.tg_id:
                 return False
             if self._afk_enabled_at > 0:
                 if not message.date:
@@ -797,9 +847,12 @@ if loader:
             return header.format(context=context) + prompt
 
         def _should_offer_help(self, message: Message) -> bool:
+            message = _unwrap_message(message)
+            if message is None:
+                return False
             if getattr(message, "out", False):
                 return False
-            if message.sender_id == self.tg_id:
+            if _message_sender_id(message) == self.tg_id:
                 return False
             text = (message.raw_text or "").strip()
             if len(text) < 8:
@@ -814,7 +867,15 @@ if loader:
             return time.time() - last >= cooldown
 
         def _owner_only(self, message: Message) -> bool:
-            return message.sender_id == self.tg_id
+            return _message_sender_id(message) == self.tg_id
+
+        def _guardian_chat_ids(self) -> set[int]:
+            chat_id = self._guardian_chat_id()
+            chat_ids = {chat_id}
+            bare = abs(chat_id)
+            if bare < 10**10:
+                chat_ids.add(int(f"-100{bare}"))
+            return chat_ids
 
         def _guardian_on(self) -> bool:
             return bool(self.config["guardian_enabled"])
@@ -928,11 +989,7 @@ if loader:
             text = "\n".join(lines)
 
             chat_id = self._guardian_chat_id()
-            chat_ids = [chat_id]
-            if chat_id < 0:
-                bare = abs(chat_id)
-                if bare < 10**10:
-                    chat_ids.append(int(f"-100{bare}"))
+            chat_ids = list(self._guardian_chat_ids())
             for cid in chat_ids:
                 try:
                     msg = await self.client.send_message(cid, text, parse_mode="html")
@@ -1058,23 +1115,24 @@ if loader:
             return self._guardian_pending.get(getattr(reply, "reply_to_msg_id", None))
 
         async def _handle_guardian_reply(self, message: Message) -> None:
-            if not self._guardian_on():
+            message = _unwrap_message(message)
+            if message is None or not self._guardian_on():
                 return
             owner_id = self._guardian_owner_id()
-            if message.sender_id != owner_id:
+            sender_id = _message_sender_id(message)
+            if sender_id != owner_id:
                 return
-            chat_ids = {self._guardian_chat_id()}
-            bare = abs(self._guardian_chat_id())
-            if bare < 10**10:
-                chat_ids.add(int(f"-100{bare}"))
-            if message.chat_id not in chat_ids:
+            if message.chat_id not in self._guardian_chat_ids():
                 return
             pending = self._resolve_guardian_pending(message)
             if not pending:
                 return
 
             text = (message.raw_text or "").strip()
-            reply_id = message.reply_to.reply_to_msg_id
+            reply_to = getattr(message, "reply_to", None)
+            if not reply_to:
+                return
+            reply_id = reply_to.reply_to_msg_id
             if _YES_RE.match(text):
                 if pending.get("kind") == "outgoing_burst" and pending.get("resume_afk"):
                     self._afk_blocked = False
@@ -1349,7 +1407,11 @@ if loader:
                 bridge = await self._ensure_bridge()
 
                 if chat:
-                    agent = await self._get_agent(message.sender_id)
+                    uid = _message_sender_id(message)
+                    if uid is None:
+                        await utils.answer(message, self.strings("error").format("Не удалось определить отправителя"))
+                        return None
+                    agent = await self._get_agent(uid)
                     run = await agent.send(full_prompt)
                     result = await run.wait()
                 else:
@@ -1389,7 +1451,12 @@ if loader:
                     self._proactive_at[message.chat_id] = time.time()
                     return text
 
-                await self._reply_text(message, text or "(пустой ответ)", query=prompt)
+                await self._reply_text(
+                    message,
+                    text or "(пустой ответ)",
+                    query=prompt,
+                    chat=chat,
+                )
                 return text
             except Exception as exc:
                 name = type(exc).__name__
@@ -1413,7 +1480,7 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.5.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.5.1]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -1439,7 +1506,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.5.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.5.1</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
                     "▫️ Отправь фото с подписью — анализ изображения\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
@@ -1448,6 +1515,7 @@ if loader:
                     "▫️ <code>.cursorchat</code> — диалог (можно слать фото)\n"
                     "▫️ <code>.cursorstop</code> — выход\n"
                     "▫️ <code>.cursorwatch</code> — следить за чатом\n"
+                    "▫️ <code>.cursorwatchlist</code> — список чатов\n"
                     "▫️ <code>.afkcursor</code> — AFK: ИИ-менеджер в личке\n\n"
                     "🔑 Cursor: <a href=\"https://cursor.com/dashboard/integrations\">Integrations</a>\n"
                     "📷 Vision: <code>openai_api_key</code> в <code>.cfg CursorAgent</code>\n"
@@ -1462,7 +1530,10 @@ if loader:
             if not self._api_key():
                 await utils.answer(message, self.strings("no_key"))
                 return
-            uid = message.sender_id
+            uid = _message_sender_id(message)
+            if uid is None:
+                await utils.answer(message, self.strings("error").format("Не удалось определить отправителя"))
+                return
             await self._close_agent(uid)
             await self._get_agent(uid)
             self._chat_users.add(uid)
@@ -1471,7 +1542,9 @@ if loader:
         @loader.command(ru_doc="Завершить диалог — .cursorstop")
         async def cursorstopcmd(self, message: Message) -> None:
             """Завершить диалог — .cursorstop"""
-            await self._close_agent(message.sender_id)
+            uid = _message_sender_id(message)
+            if uid is not None:
+                await self._close_agent(uid)
             await utils.answer(message, self.strings("chat_off"))
 
         @loader.command(ru_doc="Следить за чатом — .cursorwatch")
@@ -1524,6 +1597,7 @@ if loader:
                     return
                 self._afk_enabled = False
                 self._afk_enabled_at = 0.0
+                self._afk_blocked = False
                 self._save_afk()
                 await utils.answer(message, self.strings("afk_off"))
                 return
@@ -1544,21 +1618,31 @@ if loader:
 
             self._afk_enabled = True
             self._afk_enabled_at = time.time()
+            self._afk_blocked = False
             self._save_afk()
             await utils.answer(message, self.strings("afk_on"))
 
-        @loader.watcher(
-            incoming=True,
-            func=lambda m: not getattr(m, "out", False),
-        )
+        @loader.watcher("in", incoming=True, only_messages=True, filter=_watcher_incoming_filter)
         async def cursor_guardian_watcher(self, message: Message) -> None:
+            message = _unwrap_message(message)
+            if message is None or not self._guardian_on():
+                return
+            if message.chat_id not in self._guardian_chat_ids():
+                if not self._resolve_guardian_pending(message):
+                    return
             await self._handle_guardian_reply(message)
 
         @loader.watcher(
+            "in",
+            "only_pm",
             incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            only_messages=True,
+            filter=_watcher_incoming_filter,
         )
         async def cursor_afk_watcher(self, message: Message) -> None:
+            message = _unwrap_message(message)
+            if message is None:
+                return
             if not self._should_afk_reply(message):
                 return
             if not self._afk_cooldown_ok(message.chat_id):
@@ -1570,12 +1654,18 @@ if loader:
             await self._ask_afk(message, raw)
 
         @loader.watcher(
+            "in",
+            "only_pm",
             incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            only_messages=True,
+            filter=_watcher_incoming_filter,
         )
         async def cursor_watcher(self, message: Message) -> None:
-            uid = message.sender_id
-            if uid not in self._chat_users:
+            message = _unwrap_message(message)
+            if message is None:
+                return
+            uid = _message_sender_id(message)
+            if uid is None or uid not in self._chat_users:
                 return
             raw = (message.raw_text or "").strip()
             if self._is_image_message(message):
@@ -1586,10 +1676,15 @@ if loader:
             await self._dispatch(message, raw, chat=True)
 
         @loader.watcher(
+            "in",
             incoming=True,
-            func=lambda m: not m.is_private and not getattr(m, "out", False),
+            only_messages=True,
+            filter=_watcher_proactive_filter,
         )
         async def cursor_proactive_watcher(self, message: Message) -> None:
+            message = _unwrap_message(message)
+            if message is None:
+                return
             if not self.config["proactive_enabled"]:
                 return
             if message.chat_id not in self._watched_chats:
