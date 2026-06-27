@@ -1511,7 +1511,7 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.5.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.6.0]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -1537,7 +1537,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.5.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.6.0</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
                     "▫️ Отправь фото с подписью — анализ изображения\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
