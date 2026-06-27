@@ -618,10 +618,7 @@ if loader:
             self._clear(message.sender_id)
             await utils.answer(message, self.strings("cancelled"))
 
-        @loader.watcher(
-            incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
-        )
+        @loader.watcher(in=True, only_pm=True, only_messages=True)
         async def gift_watcher(self, message: Message) -> None:
             uid = message.sender_id
             flow = self._flows.get(uid)
