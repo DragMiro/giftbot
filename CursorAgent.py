@@ -1,5 +1,5 @@
-# @version=1.5.0
-# @description Cursor AI агент из Telegram (cloud, изображения, AFK)
+# @version=1.6.0
+# @description Cursor AI агент из Telegram (cloud, изображения, AFK, ГС)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
 
@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -26,6 +27,7 @@ import re
 import time
 import urllib.parse
 
+from telethon.tl import functions
 from telethon.tl.custom import Message
 
 logger = logging.getLogger(__name__)
@@ -156,6 +158,18 @@ def _chunks(text: str, size: int = 3900) -> list[str]:
 
 def _escape(text: str) -> str:
     return html.escape(text or "", quote=False)
+
+
+def _as_message(obj) -> Message | None:
+    """Heroku 2.0: watcher может получить Event (ChatAction) без sender_id."""
+    if obj is None:
+        return None
+    inner = getattr(obj, "message", None)
+    if inner is not None and getattr(inner, "id", None) is not None:
+        return inner
+    if hasattr(obj, "sender_id"):
+        return obj
+    return None
 
 
 def _format_inline(text: str) -> str:
@@ -345,6 +359,7 @@ if loader:
             self._outgoing_log: list[tuple[float, str]] = []
             self._guardian_pending: dict[int, dict] = {}
             self._guardian_last_alert: float = 0.0
+            self._voice_cache: dict[tuple[int, int], str] = {}
             self.config = loader.ModuleConfig(
                 loader.ConfigValue(
                     "cursor_api_key",
@@ -468,6 +483,18 @@ if loader:
                     60,
                     lambda: "Окно подсчёта исходящих (сек)",
                     validator=loader.validators.Integer(minimum=10, maximum=600),
+                ),
+                loader.ConfigValue(
+                    "transcribe_voice",
+                    True,
+                    lambda: "Распознавать голосовые (ГС) для контекста чата",
+                    validator=loader.validators.Boolean(),
+                ),
+                loader.ConfigValue(
+                    "transcribe_voice_limit",
+                    5,
+                    lambda: "Макс. ГС для распознавания за один запрос контекста",
+                    validator=loader.validators.Integer(minimum=0, maximum=20),
                 ),
             )
 
@@ -605,10 +632,16 @@ if loader:
             if limit is None:
                 limit = int(self.config["context_messages"])
             rows: list[str] = []
+            voice_left = int(self.config["transcribe_voice_limit"])
+            transcribe = bool(self.config["transcribe_voice"])
             async for msg in self.client.iter_messages(message.chat_id, limit=limit):
                 if min_timestamp and msg.date and msg.date.timestamp() < min_timestamp:
                     continue
-                text = (msg.raw_text or msg.message or "").strip()
+                text, voice_left = await self._message_text_for_context(
+                    msg,
+                    transcribe=transcribe,
+                    voice_left=voice_left,
+                )
                 if not text:
                     continue
                 author = await msg.get_sender()
@@ -618,6 +651,60 @@ if loader:
                 rows.append(f"[{stamp}] {who}: {text[:500]}{mark}")
             rows.reverse()
             return rows
+
+        @staticmethod
+        def _is_voice_message(message: Message) -> bool:
+            return bool(getattr(message, "voice", None))
+
+        async def _transcribe_voice(self, message: Message) -> str | None:
+            if not self._is_voice_message(message):
+                return None
+            key = (message.chat_id, message.id)
+            cached = self._voice_cache.get(key)
+            if cached:
+                return cached
+            try:
+                result = await self.client(
+                    functions.messages.TranscribeAudioRequest(
+                        peer=message.chat_id,
+                        msg_id=message.id,
+                    )
+                )
+                text = (getattr(result, "text", None) or "").strip()
+                if getattr(result, "pending", False) and not text:
+                    await asyncio.sleep(2)
+                    result = await self.client(
+                        functions.messages.TranscribeAudioRequest(
+                            peer=message.chat_id,
+                            msg_id=message.id,
+                        )
+                    )
+                    text = (getattr(result, "text", None) or "").strip()
+                if text:
+                    self._voice_cache[key] = text
+                    return text
+            except Exception:
+                logger.warning("voice transcribe failed for msg %s", message.id, exc_info=True)
+            return None
+
+        async def _message_text_for_context(
+            self,
+            message: Message,
+            *,
+            transcribe: bool,
+            voice_left: int,
+        ) -> tuple[str, int]:
+            text = (message.raw_text or message.message or "").strip()
+            if text:
+                return text, voice_left
+            if not self._is_voice_message(message):
+                return "", voice_left
+            if transcribe and voice_left > 0:
+                voice_left -= 1
+                transcript = await self._transcribe_voice(message)
+                if transcript:
+                    return f"🎤 [ГС]: {transcript}", voice_left
+            return "🎤 [голосовое сообщение]", voice_left
 
         async def _build_afk_context(self, message: Message) -> str:
             try:
@@ -666,7 +753,7 @@ if loader:
             text = (message.raw_text or "").strip()
             if text.startswith(".") or text.startswith("/"):
                 return False
-            if not text and not self._is_image_message(message):
+            if not text and not self._is_image_message(message) and not self._is_voice_message(message):
                 return False
             return True
 
@@ -742,41 +829,49 @@ if loader:
                 )
 
         async def _ask_afk_with_media(self, message: Message, prompt: str) -> None:
-            if not self._is_image_message(message):
-                await self._ask_afk(message, prompt)
-                return
-
-            caption = (message.raw_text or "").strip()
-            user_prompt = caption or prompt or "Собеседник прислал изображение."
-
-            try:
-                image_bytes, mime = await self._download_image(message)
-                if len(image_bytes) > 4 * 1024 * 1024:
-                    user_prompt = (
-                        f"{user_prompt}\n\n"
-                        "[Собеседник прислал изображение, но оно слишком большое для анализа. "
-                        "Сообщи, что пользователь offline, и попроси описать или повторить позже.]"
-                    )
-                else:
-                    openai_key = (self.config["openai_api_key"] or "").strip()
-                    if openai_key and _cursor_ai:
-                        vision_text = await _cursor_ai.analyze_image_openai(
-                            image_bytes,
-                            user_prompt,
-                            api_key=openai_key,
-                            mime=mime,
-                        )
-                        user_prompt = f"{user_prompt}\n\n[Содержимое изображения]\n{vision_text}"
-                    else:
+            if self._is_image_message(message):
+                caption = (message.raw_text or "").strip()
+                user_prompt = caption or prompt or "Собеседник прислал изображение."
+                try:
+                    image_bytes, mime = await self._download_image(message)
+                    if len(image_bytes) > 4 * 1024 * 1024:
                         user_prompt = (
                             f"{user_prompt}\n\n"
-                            "[Собеседник прислал изображение без подписи. "
-                            "Сообщи, что пользователь offline, и что передашь, когда он вернётся.]"
+                            "[Собеседник прислал изображение, но оно слишком большое для анализа. "
+                            "Сообщи, что пользователь offline, и попроси описать или повторить позже.]"
                         )
+                    else:
+                        openai_key = (self.config["openai_api_key"] or "").strip()
+                        if openai_key and _cursor_ai:
+                            vision_text = await _cursor_ai.analyze_image_openai(
+                                image_bytes,
+                                user_prompt,
+                                api_key=openai_key,
+                                mime=mime,
+                            )
+                            user_prompt = f"{user_prompt}\n\n[Содержимое изображения]\n{vision_text}"
+                        else:
+                            user_prompt = (
+                                f"{user_prompt}\n\n"
+                                "[Собеседник прислал изображение без подписи. "
+                                "Сообщи, что пользователь offline, и что передашь, когда он вернётся.]"
+                            )
+                    await self._ask_afk(message, user_prompt)
+                except Exception:
+                    logger.exception("afk image failed")
+                return
 
+            if self._is_voice_message(message) and self.config["transcribe_voice"]:
+                transcript = await self._transcribe_voice(message)
+                user_prompt = (
+                    f"🎤 [Голосовое сообщение]: {transcript}"
+                    if transcript
+                    else "🎤 [Голосовое сообщение без распознавания]"
+                )
                 await self._ask_afk(message, user_prompt)
-            except Exception:
-                logger.exception("afk image failed")
+                return
+
+            await self._ask_afk(message, prompt)
 
         async def _build_context(self, message: Message) -> str:
             try:
@@ -1058,6 +1153,9 @@ if loader:
             return self._guardian_pending.get(getattr(reply, "reply_to_msg_id", None))
 
         async def _handle_guardian_reply(self, message: Message) -> None:
+            message = _as_message(message)
+            if message is None:
+                return
             if not self._guardian_on():
                 return
             owner_id = self._guardian_owner_id()
@@ -1548,32 +1646,42 @@ if loader:
             await utils.answer(message, self.strings("afk_on"))
 
         @loader.watcher(
-            incoming=True,
-            func=lambda m: not getattr(m, "out", False),
+            "in",
+            filter=lambda m: _as_message(m) is not None and not getattr(m, "out", False),
         )
         async def cursor_guardian_watcher(self, message: Message) -> None:
             await self._handle_guardian_reply(message)
 
         @loader.watcher(
-            incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            "in",
+            filter=lambda m: _as_message(m) is not None
+            and m.is_private
+            and not getattr(m, "out", False),
         )
         async def cursor_afk_watcher(self, message: Message) -> None:
+            message = _as_message(message)
+            if message is None:
+                return
             if not self._should_afk_reply(message):
                 return
             if not self._afk_cooldown_ok(message.chat_id):
                 return
             raw = (message.raw_text or "").strip()
-            if self._is_image_message(message):
+            if self._is_image_message(message) or self._is_voice_message(message):
                 await self._ask_afk_with_media(message, raw)
                 return
             await self._ask_afk(message, raw)
 
         @loader.watcher(
-            incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            "in",
+            filter=lambda m: _as_message(m) is not None
+            and m.is_private
+            and not getattr(m, "out", False),
         )
         async def cursor_watcher(self, message: Message) -> None:
+            message = _as_message(message)
+            if message is None:
+                return
             uid = message.sender_id
             if uid not in self._chat_users:
                 return
@@ -1586,10 +1694,15 @@ if loader:
             await self._dispatch(message, raw, chat=True)
 
         @loader.watcher(
-            incoming=True,
-            func=lambda m: not m.is_private and not getattr(m, "out", False),
+            "in",
+            filter=lambda m: _as_message(m) is not None
+            and not m.is_private
+            and not getattr(m, "out", False),
         )
         async def cursor_proactive_watcher(self, message: Message) -> None:
+            message = _as_message(message)
+            if message is None:
+                return
             if not self.config["proactive_enabled"]:
                 return
             if message.chat_id not in self._watched_chats:
