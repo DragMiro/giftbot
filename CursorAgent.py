@@ -1,4 +1,4 @@
-# @version=1.5.0
+# @version=1.5.1
 # @description Cursor AI агент из Telegram (cloud, изображения, AFK)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -1547,17 +1547,11 @@ if loader:
             self._save_afk()
             await utils.answer(message, self.strings("afk_on"))
 
-        @loader.watcher(
-            incoming=True,
-            func=lambda m: not getattr(m, "out", False),
-        )
+        @loader.watcher(in=True, only_messages=True)
         async def cursor_guardian_watcher(self, message: Message) -> None:
             await self._handle_guardian_reply(message)
 
-        @loader.watcher(
-            incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
-        )
+        @loader.watcher(in=True, only_pm=True, only_messages=True)
         async def cursor_afk_watcher(self, message: Message) -> None:
             if not self._should_afk_reply(message):
                 return
@@ -1569,10 +1563,7 @@ if loader:
                 return
             await self._ask_afk(message, raw)
 
-        @loader.watcher(
-            incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
-        )
+        @loader.watcher(in=True, only_pm=True, only_messages=True)
         async def cursor_watcher(self, message: Message) -> None:
             uid = message.sender_id
             if uid not in self._chat_users:
@@ -1585,10 +1576,7 @@ if loader:
                 return
             await self._dispatch(message, raw, chat=True)
 
-        @loader.watcher(
-            incoming=True,
-            func=lambda m: not m.is_private and not getattr(m, "out", False),
-        )
+        @loader.watcher(in=True, no_pm=True, only_messages=True)
         async def cursor_proactive_watcher(self, message: Message) -> None:
             if not self.config["proactive_enabled"]:
                 return
