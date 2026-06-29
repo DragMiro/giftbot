@@ -1,4 +1,4 @@
-# @version=1.5.0
+# @version=1.6.0
 # @description Cursor AI агент из Telegram (cloud, изображения, AFK)
 # @author giftbot
 """CursorAgent — Cursor SDK в Heroku / Hikka userbot.
@@ -267,6 +267,7 @@ if loader:
             "thinking": "⏳ <i>Cursor анализирует чат...</i>",
             "chat_on": (
                 "💬 <b>Диалог с Cursor</b>\n\n"
+                "Отдельная память для этого чата — другие ЛС не смешиваются.\n"
                 "Пиши сообщения или присылай фото — учитываю контекст чата.\n"
                 "<code>.cursorstop</code> — выход"
             ),
@@ -334,8 +335,10 @@ if loader:
         strings_ru = strings.copy()
 
         def __init__(self) -> None:
-            self._cursor_agents: dict = {}
-            self._chat_users: set[int] = set()
+            self._cursor_agents: dict[int, object] = {}
+            self._active_chat_ids: set[int] = set()
+            self._cursor_suppress_outgoing: set[int] = set()
+            self._cursor_processing: set[int] = set()
             self._watched_chats: set[int] = set()
             self._proactive_at: dict[int, float] = {}
             self._afk_enabled: bool = False
@@ -510,12 +513,12 @@ if loader:
         def _model(self) -> str:
             return (self.config["model"] or "composer-2.5").strip()
 
-        def _cloud_options(self):
+        def _cloud_options(self, *, name: str | None = None, agent_id: str | None = None):
             cs = self._import_cursor_sdk()
-            return cs.AgentOptions(
-                api_key=self._api_key(),
-                model=self._model(),
-                cloud=cs.CloudAgentOptions(
+            opts: dict = {
+                "api_key": self._api_key(),
+                "model": self._model(),
+                "cloud": cs.CloudAgentOptions(
                     repos=[
                         cs.CloudRepository(
                             url=(self.config["repo_url"] or "").strip(),
@@ -524,7 +527,12 @@ if loader:
                     ],
                     skip_reviewer_request=True,
                 ),
-            )
+            }
+            if name:
+                opts["name"] = name[:100]
+            if agent_id:
+                opts["agent_id"] = agent_id
+            return cs.AgentOptions(**opts)
 
         async def _ensure_bridge(self):
             global _cursor_sdk_bridge
@@ -535,18 +543,42 @@ if loader:
                 _cursor_sdk_bridge = bridge
             return bridge
 
-        async def _get_agent(self, uid: int):
-            if uid in self._cursor_agents:
-                return self._cursor_agents[uid]
+        async def _agent_display_name(self, message: Message) -> str:
+            chat_id = message.chat_id
+            try:
+                if message.is_private:
+                    peer = await message.get_chat()
+                    username = getattr(peer, "username", None)
+                    peer_id = getattr(peer, "id", chat_id)
+                    if username:
+                        return f"{username}/{peer_id}"
+                    return f"user/{peer_id}"
+            except Exception:
+                pass
+            return f"chat/{chat_id}"
+
+        def _agent_session_id(self, chat_id: int) -> str:
+            return f"tg-dm-{chat_id}"
+
+        async def _get_agent(self, message: Message):
+            chat_id = message.chat_id
+            if chat_id in self._cursor_agents:
+                return self._cursor_agents[chat_id]
 
             bridge = await self._ensure_bridge()
-            agent = await bridge.create_agent(self._cloud_options())
-            self._cursor_agents[uid] = agent
+            name = await self._agent_display_name(message)
+            agent = await bridge.create_agent(
+                self._cloud_options(
+                    name=name,
+                    agent_id=self._agent_session_id(chat_id),
+                )
+            )
+            self._cursor_agents[chat_id] = agent
             return agent
 
-        async def _close_agent(self, uid: int) -> None:
-            agent = self._cursor_agents.pop(uid, None)
-            self._chat_users.discard(uid)
+        async def _close_agent(self, chat_id: int) -> None:
+            agent = self._cursor_agents.pop(chat_id, None)
+            self._active_chat_ids.discard(chat_id)
             if agent is not None:
                 await agent.close()
 
@@ -567,8 +599,12 @@ if loader:
                 query=query,
                 proactive=proactive,
             )
-            for chunk in _chunks(body):
-                await utils.answer(message, chunk)
+            self._cursor_suppress_outgoing.add(message.chat_id)
+            try:
+                for chunk in _chunks(body):
+                    await utils.answer(message, chunk)
+            finally:
+                self._cursor_suppress_outgoing.discard(message.chat_id)
             await self._guardian_after_outgoing(source)
 
         async def _describe_chat(self, message: Message) -> list[str]:
@@ -853,8 +889,8 @@ if loader:
 
         async def _reset_cursor_bridge(self) -> None:
             global _cursor_sdk_bridge
-            for uid in list(self._cursor_agents):
-                await self._close_agent(uid)
+            for chat_id in list(self._cursor_agents):
+                await self._close_agent(chat_id)
             _cursor_sdk_bridge = None
 
         @staticmethod
@@ -1349,7 +1385,7 @@ if loader:
                 bridge = await self._ensure_bridge()
 
                 if chat:
-                    agent = await self._get_agent(message.sender_id)
+                    agent = await self._get_agent(message)
                     run = await agent.send(full_prompt)
                     result = await run.wait()
                 else:
@@ -1413,7 +1449,7 @@ if loader:
                         await utils.answer(message, self.strings("error").format(_escape(str(exc))))
                     else:
                         logger.exception("cursor ask failed")
-                        hint = f"{_escape(str(exc))} [CursorAgent v1.5.0]"
+                        hint = f"{_escape(str(exc))} [CursorAgent v1.6.0]"
                         await utils.answer(message, self.strings("error").format(hint))
                 else:
                     logger.exception("cursor proactive failed")
@@ -1439,7 +1475,7 @@ if loader:
             if not prompt:
                 await utils.answer(
                     message,
-                    "🤖 <b>Cursor</b> <i>v1.5.0</i>\n\n"
+                    "🤖 <b>Cursor</b> <i>v1.6.0</i>\n\n"
                     "▫️ <code>.cursor &lt;вопрос&gt;</code> — AI с контекстом чата\n"
                     "▫️ Отправь фото с подписью — анализ изображения\n"
                     "▫️ <code>.cursor img: описание</code> — картинка\n"
@@ -1462,16 +1498,28 @@ if loader:
             if not self._api_key():
                 await utils.answer(message, self.strings("no_key"))
                 return
-            uid = message.sender_id
-            await self._close_agent(uid)
-            await self._get_agent(uid)
-            self._chat_users.add(uid)
-            await utils.answer(message, self.strings("chat_on"))
+            if not message.is_private:
+                await utils.answer(
+                    message,
+                    "💬 <code>.cursorchat</code> работает в <b>личных чатах</b>.\n"
+                    "Открой нужный ЛС и запусти команду там.",
+                )
+                return
+            chat_id = message.chat_id
+            await self._close_agent(chat_id)
+            await self._get_agent(message)
+            self._active_chat_ids.add(chat_id)
+            agent_name = await self._agent_display_name(message)
+            await utils.answer(
+                message,
+                f"{self.strings('chat_on')}\n\n"
+                f"🧠 Агент: <code>{_escape(agent_name)}</code>",
+            )
 
         @loader.command(ru_doc="Завершить диалог — .cursorstop")
         async def cursorstopcmd(self, message: Message) -> None:
             """Завершить диалог — .cursorstop"""
-            await self._close_agent(message.sender_id)
+            await self._close_agent(message.chat_id)
             await utils.answer(message, self.strings("chat_off"))
 
         @loader.command(ru_doc="Следить за чатом — .cursorwatch")
@@ -1569,21 +1617,43 @@ if loader:
                 return
             await self._ask_afk(message, raw)
 
+        async def _handle_cursor_chat_message(self, message: Message) -> None:
+            if message.chat_id not in self._active_chat_ids:
+                return
+            if (
+                message.chat_id in self._cursor_suppress_outgoing
+                or message.chat_id in self._cursor_processing
+            ):
+                return
+            raw = (message.raw_text or "").strip()
+            if self._is_image_message(message):
+                self._cursor_processing.add(message.chat_id)
+                try:
+                    await self._ask_with_media(message, raw, chat=True)
+                finally:
+                    self._cursor_processing.discard(message.chat_id)
+                return
+            if not raw or raw.startswith("."):
+                return
+            self._cursor_processing.add(message.chat_id)
+            try:
+                await self._dispatch(message, raw, chat=True)
+            finally:
+                self._cursor_processing.discard(message.chat_id)
+
         @loader.watcher(
             incoming=True,
             func=lambda m: m.is_private and not getattr(m, "out", False),
         )
         async def cursor_watcher(self, message: Message) -> None:
-            uid = message.sender_id
-            if uid not in self._chat_users:
-                return
-            raw = (message.raw_text or "").strip()
-            if self._is_image_message(message):
-                await self._ask_with_media(message, raw, chat=True)
-                return
-            if not raw or raw.startswith("."):
-                return
-            await self._dispatch(message, raw, chat=True)
+            await self._handle_cursor_chat_message(message)
+
+        @loader.watcher(
+            outgoing=True,
+            func=lambda m: m.is_private,
+        )
+        async def cursor_outgoing_watcher(self, message: Message) -> None:
+            await self._handle_cursor_chat_message(message)
 
         @loader.watcher(
             incoming=True,
