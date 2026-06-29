@@ -68,6 +68,17 @@ except ImportError:
 _SONG_PREFIX = re.compile(r"^(?:\.song|песня\s*[:\-])\s*(.+)$", re.IGNORECASE | re.DOTALL)
 
 
+def _coerce_message(obj) -> Message | None:
+    if obj is None:
+        return None
+    if isinstance(obj, Message):
+        return obj
+    nested = getattr(obj, "message", None)
+    if isinstance(nested, Message):
+        return nested
+    return None
+
+
 @dataclass(slots=True)
 class EntityData:
     type: str
@@ -619,10 +630,15 @@ if loader:
             await utils.answer(message, self.strings("cancelled"))
 
         @loader.watcher(
-            incoming=True,
-            func=lambda m: m.is_private and not getattr(m, "out", False),
+            in=True,
+            only_messages=True,
+            only_pm=True,
+            filter=lambda m: not getattr(m, "out", False),
         )
         async def gift_watcher(self, message: Message) -> None:
+            message = _coerce_message(message)
+            if message is None:
+                return
             uid = message.sender_id
             flow = self._flows.get(uid)
             if not flow or not flow.step:
